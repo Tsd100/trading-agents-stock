@@ -59,6 +59,8 @@ EASTMONEY_LIST_URL = "https://push2delay.eastmoney.com/api/qt/clist/get"
 EASTMONEY_LIST_FALLBACK_URL = "https://push2.eastmoney.com/api/qt/clist/get"
 EASTMONEY_STOCK_QUOTE_URL = "https://push2delay.eastmoney.com/api/qt/ulist.np/get"
 EASTMONEY_STOCK_QUOTE_FALLBACK_URL = "https://push2.eastmoney.com/api/qt/ulist.np/get"
+EASTMONEY_CONCEPT_QUOTE_URL = "https://push2.eastmoney.com/api/qt/stock/get"
+EASTMONEY_CONCEPT_QUOTE_FALLBACK_URL = "https://push2delay.eastmoney.com/api/qt/stock/get"
 EASTMONEY_MINUTE_KLINE_URL = "https://push2delay.eastmoney.com/api/qt/stock/kline/get"
 EASTMONEY_DAILY_KLINE_URL = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
 EASTMONEY_HOT_CONCEPT_URL = "https://emappdata.eastmoney.com/stockrank/getHotStockRankList"
@@ -316,10 +318,12 @@ _macd_alert_state: Dict[Tuple[str, str], str] = {}
 _open_move_alert_state: Dict[Tuple[str, ...], Dict[str, Any]] = {}
 _macd_alert_events: List[Dict[str, Any]] = []
 _macd_scan_status: Dict[str, Any] = {"running": False, "lastStartedAt": 0.0, "tradeDate": ""}
+_macd_screener_status: Dict[str, Any] = {"running": False, "lastStartedAt": 0.0, "tradeDate": "", "lastCompletedAt": ""}
 _backtest_db_schema_ready = False
 _concept_cache: Dict[str, Dict[str, Any]] = {}
 _hot_concept_cache: Dict[str, Dict[str, Any]] = {}
 _hot_concept_summary_cache: Dict[str, Dict[str, Any]] = {}
+_concept_index_quote_cache: Dict[str, Dict[str, Any]] = {}
 _concept_scoring_context_cache: Dict[str, Any] = {}
 _concept_scoring_refresh_state: Dict[str, bool] = {"running": False}
 _limit_up_cache: Dict[str, Any] = {}
@@ -362,6 +366,15 @@ def is_intraday_alert_session(value: datetime) -> bool:
         return False
     minutes = local.hour * 60 + local.minute
     return 9 * 60 + 15 <= minutes < 11 * 60 + 30 or 13 * 60 <= minutes < 15 * 60
+
+
+def is_alert_scan_session(value: datetime) -> bool:
+    """告警只在连续竞价时段工作，避免 9:15--9:30 产生盘中信号。"""
+    local = value.astimezone(CHINA_TZ)
+    if not is_a_share_trading_day(local.date()):
+        return False
+    minutes = local.hour * 60 + local.minute
+    return 9 * 60 + 30 <= minutes < 11 * 60 + 30 or 13 * 60 <= minutes < 15 * 60
 
 
 def is_main_board_code(code: str) -> bool:
@@ -746,28 +759,30 @@ def follow_up_snapshot_loop(stop_event: threading.Event) -> None:
     last_intraday_scan = 0.0
     last_ai_rebound_scan = 0.0
     last_macd_alert_scan = 0.0
-    blacklist_captured_dates: set[str] = set()
+    last_macd_screener_scan = 0.0
     while not stop_event.wait(30):
         now = datetime.now(CHINA_TZ)
         if now.weekday() >= 5:
             continue
         trade_date = now.strftime("%Y-%m-%d")
         current_minutes = now.hour * 60 + now.minute
-        in_session = 555 <= current_minutes < 690 or 780 <= current_minutes < 900
+        alert_session = is_alert_scan_session(now)
         try:
-            # 顶部告警不依赖浏览器页面是否打开：交易时段每分钟主动扫描
-            # 白名单与自定义黑名单。扫描内部有运行锁，慢行情源不会重叠执行。
-            if in_session and time.monotonic() - last_macd_alert_scan >= 60:
+            # 顶部告警只扫描 ETF 与科技固定观察池；白名单/黑名单任务已停用。
+            if alert_session and time.monotonic() - last_macd_alert_scan >= 60:
                 start_macd_alert_scan(force=True)
                 last_macd_alert_scan = time.monotonic()
+            # MACD 选股独立于页面生命周期：交易中每十分钟更新一次，15:00
+            # 的最后一轮写入当天收盘结果，之后不再触发外部行情请求。
+            if is_macd_screener_session(now) and time.monotonic() - last_macd_screener_scan >= 600:
+                start_macd_screener_scan(force=True)
+                last_macd_screener_scan = time.monotonic()
             # 已移除的分钟预测与旧版阈值告警不再后台扫描。AI 页面保留按需
             # 读取，避免每分钟全市场/AI 池扫描抢占白名单和图表行情资源。
-            if now.hour == 15 and now.minute >= 5 and trade_date not in blacklist_captured_dates:
-                refresh_daily_blacklist(trade_date)
-                save_daily_whitelist_snapshot(trade_date)
+            if now.hour == 15 and now.minute >= 5 and trade_date not in captured_dates:
                 archived = archive_post_close_quote_snapshot(trade_date)
-                blacklist_captured_dates.add(trade_date)
-                print(f"黑名单及白名单收盘快照已保存：{trade_date}；本地报价归档 {archived} 只")
+                captured_dates.add(trade_date)
+                print(f"收盘本地报价快照已归档：{trade_date}；{archived} 只")
         except (MarketDataError, OSError, ValueError, sqlite3.Error) as exc:
             print(f"后台全市场评分扫描失败: {exc}")
 
@@ -1340,20 +1355,207 @@ def get_menu_members(menu: str, codes: Optional[List[str]] = None) -> Dict[str, 
             {"code": str(code), "name": str(name or code), "industry": str(industry or "--"), "reason": str(reason or "--")}
             for code, name, industry, reason in rows
         ], "source": "本地 SQLite 黑名单成员快照"}
+    # 不能用“全市场最新日期”读取固定池：收盘归档可能正在分批写入，
+    # 例如 9/25 只有部分证券写入时，会把其它 ETF 成分的名称降级成代码。
+    # 每只股票独立选取自己的最近有效快照，保证成员名称和行情一起可用。
     with open_backtest_db() as connection:
-        date_row = connection.execute("SELECT MAX(trade_date) FROM daily_close_quotes WHERE trade_date<=?", (now.date().isoformat(),)).fetchone()
-        trade_date = str(date_row[0] or "") if date_row else ""
         placeholders = ",".join("?" for _ in requested)
         rows = connection.execute(
-            f"SELECT code,quote_json FROM daily_close_quotes WHERE trade_date=? AND code IN ({placeholders})", (trade_date, *requested)
-        ).fetchall() if trade_date and requested else []
-    quotes = {str(code): json.loads(raw) for code, raw in rows}
+            f"SELECT code,trade_date,quote_json FROM daily_close_quotes "
+            f"WHERE code IN ({placeholders}) AND trade_date<=? "
+            f"ORDER BY code,trade_date DESC",
+            (*requested, now.date().isoformat()),
+        ).fetchall() if requested else []
+    quotes: Dict[str, Dict[str, Any]] = {}
+    quote_dates: List[str] = []
+    for code, quote_date, raw in rows:
+        code = str(code)
+        if code in quotes:
+            continue
+        try:
+            quotes[code] = json.loads(raw)
+            quote_dates.append(str(quote_date))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+    trade_date = max(quote_dates) if quote_dates else ""
     members = []
     for code in requested:
         quote = quotes.get(code) or {}
         members.append({"code": code, "name": str(quote.get("name") or code), "industry": str(quote.get("industry") or "--"), **quote})
     label = "ETF" if menu == "etf" else "科技"
     return {"menu": menu, "tradeDate": trade_date or None, "members": members, "source": f"本地 SQLite {label} 成员与收盘快照"}
+
+
+def get_menu_quote_batch(menu: str, codes: List[str]) -> Dict[str, Any]:
+    """Hydrate one visible fixed-menu batch with a shared Tencent request.
+
+    The browser must never fan out one ``/api/stock`` request per visible row:
+    it would repeat history loading and make a menu compete with every thumbnail.
+    This path starts from the local close cache and asks the real-time provider
+    once per 80-code batch only during the trading session.
+    """
+    if menu not in {"etf", "tech"}:
+        raise ValueError("仅固定观察池支持批量报价")
+    requested = list(dict.fromkeys(str(code) for code in codes))
+    if not requested or len(requested) > 100 or any(not re.fullmatch(r"\d{6}", code) for code in requested):
+        raise ValueError("批量股票代码不正确")
+    base = get_menu_members(menu, requested)
+    # 午休及收盘后不应再次穿透实时源，但固定池仍必须展示上午/当日最后
+    # 一笔本地报价。daily_close_quotes 是收盘归档，list_quote_cache 则保存
+    # 开盘时各菜单批量刷新得到的最新快照，两者不能互相替代。
+    try:
+        with open_backtest_db() as connection:
+            cache_rows = connection.execute(
+                f"SELECT code,quote_json FROM list_quote_cache WHERE code IN ({','.join('?' for _ in requested)})",
+                tuple(requested),
+            ).fetchall()
+        cached_quotes = {str(code): json.loads(raw or "{}") for code, raw in cache_rows}
+    except (sqlite3.Error, OSError, TypeError, ValueError, json.JSONDecodeError):
+        cached_quotes = {}
+    base_members = []
+    for member in base.get("members") or []:
+        code = str(member.get("code") or "")
+        quote = cached_quotes.get(code) or {}
+        base_members.append({**member, **quote, "code": code, "name": str(quote.get("name") or member.get("name") or code)})
+    payload = hydrate_list_quotes({
+        "stocks": base_members,
+        "tradeDate": base.get("tradeDate"),
+        "membershipDate": base.get("tradeDate"),
+        "source": base.get("source"),
+    }, fetch_if_cache_missing=not bool(cached_quotes))
+    # 报价可能走实时、收盘归档或历史兜底分支；关联概念是独立的本地
+    # 元数据，不能依赖某个报价分支恰好完成回填。统一在最终出口合并，
+    # 避免 ETF/科技固定池出现“价格正常、关联概念为 --”的情况。
+    try:
+        with open_backtest_db() as connection:
+            placeholders = ",".join("?" for _ in requested)
+            concept_rows = connection.execute(
+                f"SELECT code,concepts_json FROM stock_concept_cache WHERE code IN ({placeholders})",
+                tuple(requested),
+            ).fetchall() if requested else []
+        concept_map = {str(code): json.loads(raw or "[]") for code, raw in concept_rows}
+        for quote in payload.get("stocks") or []:
+            code = str(quote.get("code") or "")
+            items = concept_map.get(code)
+            if items is None:
+                continue
+            concepts = [item.get("name") if isinstance(item, dict) else str(item) for item in items]
+            quote["relatedConcepts"] = [item for item in concepts if item and "报预增" not in item]
+            quote["relatedConcept"] = (quote["relatedConcepts"] or ["--"])[0]
+    except (sqlite3.Error, OSError, TypeError, ValueError, json.JSONDecodeError):
+        pass
+    return {
+        "menu": menu,
+        "tradeDate": payload.get("tradeDate") or base.get("tradeDate"),
+        "updatedAt": payload.get("updatedAt") or datetime.now(CHINA_TZ).isoformat(),
+        "source": payload.get("source") or base.get("source"),
+        "quotes": payload.get("stocks") or [],
+    }
+
+
+def get_cached_chart_history(code: str) -> Optional[Dict[str, Any]]:
+    """Return locally persisted bars, merged with the newest close snapshot.
+
+    ``midterm_history_cache`` is intentionally long lived.  It can therefore
+    lag the daily close snapshot by several sessions; returning it directly
+    makes the MACD thumbnail calculate from old bars.  Reconcile the final
+    bar from SQLite before serving it, without any third-party request.
+    """
+    if not re.fullmatch(r"\d{6}", str(code)):
+        return None
+    try:
+        history = load_cached_daily_rows(code)
+        with open_backtest_db() as connection:
+            snapshot_row = connection.execute(
+                """SELECT trade_date, quote_json FROM daily_close_quotes
+                   WHERE code=? AND trade_date<=? ORDER BY trade_date DESC LIMIT 1""",
+                (str(code), datetime.now(CHINA_TZ).date().isoformat()),
+            ).fetchone()
+    except (sqlite3.Error, OSError, TypeError, ValueError, json.JSONDecodeError):
+        history = []
+        snapshot_row = None
+    if len(history) < 20:
+        return None
+    name = str(code)
+    quote_trade_date = None
+    # 仅追加最新收盘不能修复历史中断：例如 9/11 后直接拼上 9/24，
+    # EMA 会把十多个交易日的真实走势压成一根柱，两个 MACD 缩略图都会失真。
+    # 检测最近区间的大缺口后，优先用日线源完整回补，并落回本地缓存。
+    def has_large_daily_gap(rows: List[Dict[str, Any]]) -> bool:
+        dates: List[datetime] = []
+        for item in rows[-45:]:
+            try:
+                dates.append(datetime.strptime(str(item.get("date") or ""), "%Y-%m-%d"))
+            except ValueError:
+                continue
+        return any((right - left).days > 8 for left, right in zip(dates, dates[1:]))
+
+    snapshot_date = str(snapshot_row[0] or "") if snapshot_row else ""
+    if snapshot_date and (str(history[-1].get("date") or "") != snapshot_date or has_large_daily_gap(history)):
+        try:
+            refreshed_rows, refreshed_source = fetch_daily_rows_with_failover(str(code))
+            refreshed_last_date = str(refreshed_rows[-1].get("date") or "") if refreshed_rows else ""
+            # 本地缓存本身也是 failover 的最后兜底，不能把同一份旧数据重新写回。
+            if refreshed_source != "本地历史缓存" and refreshed_last_date >= snapshot_date:
+                history = refreshed_rows[-HISTORY_DAYS:]
+                add_moving_averages(history)
+                with open_backtest_db() as connection:
+                    connection.execute(
+                        """INSERT OR REPLACE INTO midterm_history_cache(code,latest_date,bars_json,fetched_at)
+                           VALUES(?,?,?,?)""",
+                        (str(code), refreshed_last_date, json.dumps(history, ensure_ascii=False), datetime.now(CHINA_TZ).isoformat()),
+                    )
+                    connection.commit()
+        except (MarketDataError, OSError, TypeError, ValueError, sqlite3.Error, json.JSONDecodeError):
+            # 外部日线暂不可用时保留本地数据；下一次缩略图请求会再次尝试回补。
+            pass
+    if snapshot_row:
+        try:
+            quote = json.loads(snapshot_row[1] or "{}")
+            close = number(quote.get("price"))
+            if close is not None and re.fullmatch(r"\d{4}-\d{2}-\d{2}", snapshot_date):
+                name = str(quote.get("name") or code)
+                quote_trade_date = str(quote.get("quoteTradeDate") or snapshot_date)
+                latest = history[-1] if history else {}
+                previous_close = number(quote.get("previousClose"))
+                if str(latest.get("date") or "") != snapshot_date:
+                    previous_close = previous_close or number(latest.get("close"))
+                    history.append({
+                        "date": snapshot_date,
+                        "open": number(quote.get("open")) or close,
+                        "close": close,
+                        "high": number(quote.get("high")) or close,
+                        "low": number(quote.get("low")) or close,
+                        "volume": number(quote.get("volume")) or 0.0,
+                        "changePct": number(quote.get("changePct")) if number(quote.get("changePct")) is not None else return_pct(previous_close, close),
+                        "changeAmount": close - previous_close if previous_close is not None else None,
+                    })
+                else:
+                    latest.update({
+                        "open": number(quote.get("open")) or number(latest.get("open")) or close,
+                        "close": close,
+                        "high": number(quote.get("high")) or close,
+                        "low": number(quote.get("low")) or close,
+                        "volume": number(quote.get("volume")) or number(latest.get("volume")) or 0.0,
+                        "changePct": number(quote.get("changePct")) if number(quote.get("changePct")) is not None else latest.get("changePct"),
+                    })
+                history = history[-HISTORY_DAYS:]
+                add_moving_averages(history)
+                # 同步回历史缓存，之后同一股票的 K 线和 MACD 都会使用同一收盘日。
+                with open_backtest_db() as connection:
+                    connection.execute(
+                        """INSERT OR REPLACE INTO midterm_history_cache(code,latest_date,bars_json,fetched_at)
+                           VALUES(?,?,?,?)""",
+                        (str(code), snapshot_date, json.dumps(history, ensure_ascii=False), datetime.now(CHINA_TZ).isoformat()),
+                    )
+                    connection.commit()
+        except (sqlite3.Error, OSError, TypeError, ValueError, json.JSONDecodeError):
+            pass
+    return {
+        "code": str(code), "name": name, "history": history[-HISTORY_DAYS:],
+        "quoteTradeDate": quote_trade_date,
+        "dataSource": "本地 SQLite 日线缓存 + 最新交易日收盘快照", "cached": True,
+    }
 
 
 def fetch_tushare_auction_rows(trade_date: str) -> List[Dict[str, Any]]:
@@ -1547,6 +1749,8 @@ def resolve_stock_name(code: str) -> str:
 
 def eastmoney_stock_quote(code: str, *, fast: bool = False) -> Optional[Dict[str, Any]]:
     """Read one current quote without falling back to a daily close."""
+    if not quote_provider_available("eastmoney"):
+        return None
     market_prefix = "1" if code.startswith(("5", "6", "9")) else "0"
     params = {
         "fltt": 2,
@@ -1582,6 +1786,7 @@ def eastmoney_stock_quote(code: str, *, fast: bool = False) -> Optional[Dict[str
                     updated_at = datetime.fromtimestamp(timestamp, CHINA_TZ)
                 except (OverflowError, OSError, ValueError):
                     updated_at = None
+            record_quote_provider_result("eastmoney", True)
             return {
                 "price": price,
                 "changePct": change_pct,
@@ -1601,6 +1806,7 @@ def eastmoney_stock_quote(code: str, *, fast: bool = False) -> Optional[Dict[str
             }
         except (MarketDataError, OSError, TypeError, ValueError):
             continue
+    record_quote_provider_result("eastmoney", False)
     return None
 
 
@@ -1889,6 +2095,11 @@ def hydrate_close_snapshot_metadata(trade_date: str, requested_codes: Optional[L
             }
             if not metadata:
                 return
+            requested = {str(code) for code in (requested_codes or []) if re.fullmatch(r"\d{6}", str(code))}
+            # 部分市场快照不能被当作完整结果：黑名单会因此永久只显示一小部分
+            # 流通市值/换手率。交由下方腾讯分批兜底补齐缺失代码。
+            if requested and len(requested - set(metadata)) > max(5, len(requested) // 20):
+                raise MarketDataError("东方财富批量快照返回不完整")
             with open_backtest_db() as connection:
                 cached_rows = connection.execute(
                     "SELECT code,quote_json FROM daily_close_quotes WHERE trade_date=?", (trade_date,)
@@ -1915,21 +2126,35 @@ def hydrate_close_snapshot_metadata(trade_date: str, requested_codes: Optional[L
             if not codes:
                 return
             try:
-                url = TENCENT_BATCH_QUOTE_URL + ",".join(tencent_quote_symbol(code) for code in codes)
-                response = subprocess.run(
-                    ["curl", "-fsSL", "--connect-timeout", "2", "--max-time", "5", url],
-                    capture_output=True, check=True, timeout=6,
-                )
                 metadata: Dict[str, Dict[str, Any]] = {}
-                for match in re.finditer(r'="([^"]+)"', response.stdout.decode("gb18030", errors="replace")):
-                    fields = match.group(1).split("~")
-                    if len(fields) < 46 or fields[2] not in codes:
-                        continue
-                    metadata[fields[2]] = {
-                        "marketCap": number(fields[44]) * 100_000_000 if number(fields[44]) is not None else None,
-                        "floatMarketCap": number(fields[45]) * 100_000_000 if number(fields[45]) is not None else None,
-                        "turnover": number(fields[38]),
-                    }
+                # 腾讯批量接口对 URL 长度有限制。黑名单上千只不能拼成单次
+                # 请求，否则只会返回前一小段，造成流通值/换手率看似随机缺失。
+                def fetch_tencent_metadata(batch: List[str]) -> Dict[str, Dict[str, Any]]:
+                    url = TENCENT_BATCH_QUOTE_URL + ",".join(tencent_quote_symbol(code) for code in batch)
+                    response = subprocess.run(
+                        ["curl", "-fsSL", "--connect-timeout", "2", "--max-time", "5", url],
+                        capture_output=True, check=True, timeout=6,
+                    )
+                    result: Dict[str, Dict[str, Any]] = {}
+                    for match in re.finditer(r'="([^"]+)"', response.stdout.decode("gb18030", errors="replace")):
+                        fields = match.group(1).split("~")
+                        if len(fields) < 46 or fields[2] not in batch:
+                            continue
+                        result[fields[2]] = {
+                            "marketCap": number(fields[44]) * 100_000_000 if number(fields[44]) is not None else None,
+                            "floatMarketCap": number(fields[45]) * 100_000_000 if number(fields[45]) is not None else None,
+                            "turnover": number(fields[38]),
+                        }
+                    return result
+
+                batches = [codes[index:index + 80] for index in range(0, len(codes), 80)]
+                with ThreadPoolExecutor(max_workers=min(8, len(batches))) as executor:
+                    futures = [executor.submit(fetch_tencent_metadata, batch) for batch in batches]
+                    for future in as_completed(futures):
+                        try:
+                            metadata.update(future.result())
+                        except (OSError, ValueError, subprocess.SubprocessError):
+                            continue
                 if not metadata:
                     return
                 with open_backtest_db() as connection:
@@ -2518,6 +2743,400 @@ def macd_color_state(closes: List[float], fast_period: int, slow_period: int, si
     return "red" if histogram >= 0 else "green"
 
 
+def macd_histogram_series(closes: List[float], fast_period: int, slow_period: int, signal_period: int) -> List[float]:
+    """Return the full MACD histogram series used by the MACD screener."""
+    if len(closes) < slow_period:
+        return []
+    def ema(values: List[float], period: int) -> List[float]:
+        result = [values[0]]
+        alpha = 2 / (period + 1)
+        for value in values[1:]:
+            result.append(value * alpha + result[-1] * (1 - alpha))
+        return result
+    dif = [fast - slow for fast, slow in zip(ema(closes, fast_period), ema(closes, slow_period))]
+    dea = ema(dif, signal_period)
+    return [(value - signal) * 2 for value, signal in zip(dif, dea)]
+
+
+def macd_dual_red_rule(slow_red_days: int, fast_red_days: int,
+                       three_day_gain: Optional[float], latest_change_pct: Optional[float]) -> Optional[str]:
+    """Return the exclusive dual-MACD-red bucket used by the screener."""
+    if (slow_red_days < 2 or fast_red_days < 2 or three_day_gain is None or three_day_gain < 5
+            or latest_change_pct is None or latest_change_pct < -1):
+        return None
+    days = min(slow_red_days, fast_red_days)
+    return "双线连红≥5日+涨5%" if days >= 5 else f"双线连红{days}日+涨5%"
+
+
+MACD_SELECTION_RULE_LABELS = {
+    "慢线连红+快线翻红": "慢线连红 + 快线翻红",
+    "双线同步翻红": "双线同步翻红",
+    "双线连红2日+涨5%": "双线连红 2 日 + 近3日涨幅 ≥5%",
+    "双线连红3日+涨5%": "双线连红 3 日 + 近3日涨幅 ≥5%",
+    "双线连红4日+涨5%": "双线连红 4 日 + 近3日涨幅 ≥5%",
+    "双线连红≥5日+涨5%": "双线连红 ≥5 日 + 近3日涨幅 ≥5%",
+}
+
+
+def macd_selection_rule_label(rule: Any) -> str:
+    """Return the UI wording so entry alerts and the condition menu never drift."""
+    return MACD_SELECTION_RULE_LABELS.get(str(rule or ""), str(rule or "MACD选股条件"))
+
+
+def alert_board_for_code(code: Any) -> str:
+    """Map a stock code to the existing three top-alert panels."""
+    normalized = str(code or "")
+    if re.match(r"^(300|301)", normalized):
+        return "growth"
+    if re.match(r"^(688|689|4|8|92)", normalized):
+        return "starBse"
+    return "main"
+
+
+def is_macd_screener_session(now: Optional[datetime] = None) -> bool:
+    """MACD选股遵循系统 09:15 行情起点，15:00 完成最后一次固化。"""
+    current = (now or datetime.now(CHINA_TZ)).astimezone(CHINA_TZ)
+    if not is_a_share_trading_day(current.date()):
+        return False
+    seconds = current.hour * 3600 + current.minute * 60 + current.second
+    return (9 * 3600 + 15 * 60 <= seconds < 11 * 3600 + 30 * 60
+            or 13 * 3600 <= seconds <= 15 * 3600)
+
+
+def _macd_screener_trade_date(now: Optional[datetime] = None) -> str:
+    current = (now or datetime.now(CHINA_TZ)).astimezone(CHINA_TZ)
+    with open_backtest_db() as connection:
+        row = connection.execute(
+            "SELECT MAX(trade_date) FROM macd_screener_members WHERE trade_date<=?", (current.date().isoformat(),)
+        ).fetchone()
+    return str(row[0] or "") if row else ""
+
+
+def scan_macd_screener() -> None:
+    """Rebuild the two-rule MACD pool from all cached A-share histories.
+
+    During the session the final daily bar is represented by the latest market
+    price.  Therefore a stock immediately leaves the table when it no longer
+    satisfies either condition; the 15:00 run becomes the frozen close result.
+    """
+    now = datetime.now(CHINA_TZ)
+    if not is_macd_screener_session(now):
+        return
+    trade_date = now.date().isoformat()
+    with _cache_lock:
+        if _macd_screener_status.get("running"):
+            return
+        _macd_screener_status.update({"running": True, "lastStartedAt": time.monotonic(), "tradeDate": trade_date})
+    try:
+        rows, _ = fetch_market_rows("all")
+        live = {str(row.get("f12") or ""): row for row in rows if re.fullmatch(r"\d{6}", str(row.get("f12") or ""))}
+        with open_backtest_db() as connection:
+            histories = connection.execute("SELECT code,bars_json FROM midterm_history_cache").fetchall()
+        selected: List[Tuple[str, str, str, str, str]] = []
+        selected_stocks: Dict[str, Dict[str, Any]] = {}
+        for code, raw_history in histories:
+            code = str(code)
+            quote = live.get(code)
+            price = number((quote or {}).get("f2"))
+            if price is None or price <= 0:
+                continue
+            try:
+                history = json.loads(raw_history or "[]")
+                closes = [number(item.get("close")) for item in history
+                          if str(item.get("date") or "").replace("-", "") < trade_date.replace("-", "") and number(item.get("close")) is not None]
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            # 当前实时价相对「前 3 个交易日收盘价」的涨幅：不把今天计入三天。
+            three_days_ago_close = closes[-3] if len(closes) >= 3 else None
+            three_day_gain = ((price / three_days_ago_close) - 1) * 100 if three_days_ago_close and three_days_ago_close > 0 else None
+            latest_change_pct = number((quote or {}).get("f3"))
+            closes.append(price)
+            slow = macd_histogram_series(closes, 10, 20, 7)
+            fast = macd_histogram_series(closes, 5, 10, 3)
+            if len(slow) < 2 or len(fast) < 2:
+                continue
+            slow_red_days = 0
+            for value in reversed(slow):
+                if value >= 0:
+                    slow_red_days += 1
+                else:
+                    break
+            fast_red_days = 0
+            for value in reversed(fast):
+                if value >= 0:
+                    fast_red_days += 1
+                else:
+                    break
+            fast_flip = fast[-2] < 0 <= fast[-1]
+            slow_flip = slow[-2] < 0 <= slow[-1]
+            rules: List[str] = []
+            if slow_red_days >= 5 and fast_flip:
+                rules.append("慢线连红+快线翻红")
+            if slow_flip and fast_flip:
+                rules.append("双线同步翻红")
+            dual_red_rule = macd_dual_red_rule(slow_red_days, fast_red_days, three_day_gain, latest_change_pct)
+            if dual_red_rule:
+                rules.append(dual_red_rule)
+            if not rules:
+                continue
+            stock = {
+                "code": code,
+                "name": str(quote.get("f14") or code),
+                "industry": str(quote.get("f100") or "--"),
+                "actualIndustry": str(quote.get("f100") or "--"),
+                "price": price,
+                "changePct": number(quote.get("f3")),
+                "open": number(quote.get("f17")),
+                "high": number(quote.get("f15")),
+                "low": number(quote.get("f16")),
+                "amount": number(quote.get("f6")),
+                "netInflow": number(quote.get("f62")),
+                "marketCap": number(quote.get("f20")),
+                "floatMarketCap": number(quote.get("f21")),
+                "turnover": number(quote.get("f8")),
+                "updatedAt": now.isoformat(),
+                "quoteTradeDate": trade_date,
+                "liveQuote": True,
+                "dataSource": "全市场实时行情 + 本地日线 MACD",
+                "macdSelectionRules": rules,
+                "macdSlowRedDays": slow_red_days,
+                "macdFastRedDays": fast_red_days,
+                "macdThreeDayGain": three_day_gain,
+                "macdLatestChangePct": latest_change_pct,
+            }
+            selected.append((trade_date, code, "/".join(rules), json.dumps(stock, ensure_ascii=False), now.isoformat()))
+            selected_stocks[code] = stock
+        with open_backtest_db() as connection:
+            previous_rows = connection.execute(
+                "SELECT code,rule,stock_json FROM macd_screener_members WHERE trade_date=?", (trade_date,)
+            ).fetchall()
+            previous_stocks: Dict[str, Dict[str, Any]] = {}
+            for previous_code, previous_rule, raw_stock in previous_rows:
+                try:
+                    previous_stock = json.loads(raw_stock or "{}")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    previous_stock = {}
+                previous_stock["code"] = str(previous_stock.get("code") or previous_code)
+                previous_stock["macdSelectionRules"] = [item for item in str(previous_rule or "").split("/") if item]
+                previous_stocks[str(previous_code)] = previous_stock
+            connection.execute("DELETE FROM macd_screener_members WHERE trade_date=?", (trade_date,))
+            if selected:
+                connection.executemany(
+                    "INSERT INTO macd_screener_members(trade_date,code,rule,stock_json,scanned_at) VALUES (?,?,?,?,?)", selected
+                )
+            connection.commit()
+        record_macd_screener_lifecycle_alerts(trade_date, now, previous_stocks, selected_stocks)
+        with _cache_lock:
+            _macd_screener_status["lastCompletedAt"] = now.isoformat()
+    except (MarketDataError, OSError, ValueError, sqlite3.Error, TypeError):
+        pass
+    finally:
+        with _cache_lock:
+            _macd_screener_status["running"] = False
+
+
+def start_macd_screener_scan(force: bool = False) -> None:
+    if not is_macd_screener_session(datetime.now(CHINA_TZ)):
+        return
+    with _cache_lock:
+        running = bool(_macd_screener_status.get("running"))
+        stale = time.monotonic() - float(_macd_screener_status.get("lastStartedAt") or 0) >= 600
+    if running or (not force and not stale):
+        return
+    threading.Thread(target=scan_macd_screener, name="macd-screener-scan", daemon=True).start()
+
+
+def bootstrap_macd_screener_from_local_close() -> None:
+    """Seed the pool after deployment when no 15:00 MACD result exists yet.
+
+    Pick the newest *complete* local close cohort instead of a newer, partial
+    archive.  Normal trading-day scans always supersede this bootstrap at 15:00.
+    """
+    # 优先以最近交易日的全市场收盘报价补齐一次。仅在本地尚无该日
+    # 结果时调用；写入后非交易时段始终只读取 SQLite。
+    latest_close_date = latest_local_market_trade_date(datetime.now(CHINA_TZ).date().isoformat())
+    if latest_close_date:
+        try:
+            live_rows, _ = fetch_market_rows("all")
+            live_quotes = {str(row.get("f12") or ""): row for row in live_rows if re.fullmatch(r"\d{6}", str(row.get("f12") or ""))}
+            with open_backtest_db() as connection:
+                histories = connection.execute("SELECT code,bars_json FROM midterm_history_cache").fetchall()
+            selected: List[Tuple[str, str, str, str, str]] = []
+            saved_at = datetime.now(CHINA_TZ).isoformat()
+            target_compact = latest_close_date.replace("-", "")
+            for code, raw_history in histories:
+                code = str(code)
+                quote = live_quotes.get(code)
+                price = number((quote or {}).get("f2"))
+                if price is None or price <= 0:
+                    continue
+                try:
+                    history = json.loads(raw_history or "[]")
+                    closes = [number(item.get("close")) for item in history
+                              if str(item.get("date") or "").replace("-", "") < target_compact and number(item.get("close")) is not None]
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                three_days_ago_close = closes[-3] if len(closes) >= 3 else None
+                three_day_gain = ((price / three_days_ago_close) - 1) * 100 if three_days_ago_close and three_days_ago_close > 0 else None
+                latest_change_pct = number(quote.get("f3"))
+                closes.append(price)
+                slow = macd_histogram_series(closes, 10, 20, 7)
+                fast = macd_histogram_series(closes, 5, 10, 3)
+                if len(slow) < 2 or len(fast) < 2:
+                    continue
+                red_days = 0
+                for value in reversed(slow):
+                    if value >= 0: red_days += 1
+                    else: break
+                fast_red_days = 0
+                for value in reversed(fast):
+                    if value >= 0: fast_red_days += 1
+                    else: break
+                rules: List[str] = []
+                if red_days >= 5 and fast[-2] < 0 <= fast[-1]: rules.append("慢线连红+快线翻红")
+                if slow[-2] < 0 <= slow[-1] and fast[-2] < 0 <= fast[-1]: rules.append("双线同步翻红")
+                dual_red_rule = macd_dual_red_rule(red_days, fast_red_days, three_day_gain, latest_change_pct)
+                if dual_red_rule: rules.append(dual_red_rule)
+                if not rules:
+                    continue
+                stock = {
+                    "code": code, "name": str(quote.get("f14") or code), "industry": str(quote.get("f100") or "--"),
+                    "actualIndustry": str(quote.get("f100") or "--"), "price": price, "changePct": number(quote.get("f3")),
+                    "open": number(quote.get("f17")), "high": number(quote.get("f15")), "low": number(quote.get("f16")),
+                    "amount": number(quote.get("f6")), "netInflow": number(quote.get("f62")), "marketCap": number(quote.get("f20")),
+                    "floatMarketCap": number(quote.get("f21")), "turnover": number(quote.get("f8")), "updatedAt": saved_at,
+                    "quoteTradeDate": latest_close_date, "liveQuote": False, "dataSource": "最近交易日全市场收盘报价 + 本地日线 MACD",
+                    "macdSelectionRules": rules, "macdSlowRedDays": red_days,
+                    "macdFastRedDays": fast_red_days,
+                    "macdThreeDayGain": three_day_gain,
+                    "macdLatestChangePct": latest_change_pct,
+                }
+                selected.append((latest_close_date, code, "/".join(rules), json.dumps(stock, ensure_ascii=False), saved_at))
+            if selected:
+                with open_backtest_db() as connection:
+                    connection.execute("DELETE FROM macd_screener_members WHERE trade_date=?", (latest_close_date,))
+                    connection.executemany("INSERT INTO macd_screener_members(trade_date,code,rule,stock_json,scanned_at) VALUES (?,?,?,?,?)", selected)
+                    connection.commit()
+                return
+        except (MarketDataError, OSError, ValueError, sqlite3.Error, TypeError):
+            pass
+    # 行情源临时不可用时，退回本地覆盖最完整的收盘批次，确保页面可用。
+    with open_backtest_db() as connection:
+        date_row = connection.execute(
+            "WITH cohorts AS (SELECT latest_date,COUNT(*) AS count FROM midterm_history_cache GROUP BY latest_date) "
+            "SELECT latest_date,count FROM cohorts "
+            "WHERE count >= (SELECT MAX(count) * 0.8 FROM cohorts) "
+            "ORDER BY latest_date DESC LIMIT 1"
+        ).fetchone()
+        if not date_row:
+            return
+        trade_date = str(date_row[0] or "")
+        histories = connection.execute(
+            "SELECT code,bars_json FROM midterm_history_cache WHERE latest_date=?", (trade_date,)
+        ).fetchall()
+        quote_rows = connection.execute(
+            "SELECT code,quote_json FROM daily_close_quotes WHERE trade_date=?", (trade_date,)
+        ).fetchall()
+    quotes: Dict[str, Dict[str, Any]] = {}
+    for code, raw in quote_rows:
+        try:
+            quotes[str(code)] = json.loads(raw or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+    saved_at = datetime.now(CHINA_TZ).isoformat()
+    selected: List[Tuple[str, str, str, str, str]] = []
+    for code, raw_history in histories:
+        code = str(code)
+        try:
+            history = json.loads(raw_history or "[]")
+            closes = [number(item.get("close")) for item in history if number(item.get("close")) is not None]
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        price = number((quotes.get(code) or {}).get("price")) or closes[-1]
+        # 本地收盘序列末尾就是最新交易日，基准取其之前第 3 个交易日。
+        three_days_ago_close = closes[-4] if len(closes) >= 4 else None
+        three_day_gain = ((price / three_days_ago_close) - 1) * 100 if three_days_ago_close and three_days_ago_close > 0 else None
+        latest_change_pct = number((quotes.get(code) or {}).get("changePct"))
+        if latest_change_pct is None and len(closes) >= 2 and closes[-2] > 0:
+            latest_change_pct = ((price / closes[-2]) - 1) * 100
+        slow = macd_histogram_series(closes, 10, 20, 7)
+        fast = macd_histogram_series(closes, 5, 10, 3)
+        if len(slow) < 2 or len(fast) < 2:
+            continue
+        red_days = 0
+        for value in reversed(slow):
+            if value >= 0:
+                red_days += 1
+            else:
+                break
+        fast_red_days = 0
+        for value in reversed(fast):
+            if value >= 0:
+                fast_red_days += 1
+            else:
+                break
+        rules: List[str] = []
+        if red_days >= 5 and fast[-2] < 0 <= fast[-1]:
+            rules.append("慢线连红+快线翻红")
+        if slow[-2] < 0 <= slow[-1] and fast[-2] < 0 <= fast[-1]:
+            rules.append("双线同步翻红")
+        dual_red_rule = macd_dual_red_rule(red_days, fast_red_days, three_day_gain, latest_change_pct)
+        if dual_red_rule:
+            rules.append(dual_red_rule)
+        if not rules:
+            continue
+        quote = quotes.get(code) or {}
+        stock = {
+            "code": code, "name": str(quote.get("name") or code),
+            "industry": str(quote.get("industry") or "--"), "actualIndustry": str(quote.get("industry") or "--"),
+            "price": price, "changePct": number(quote.get("changePct")),
+            "open": number(quote.get("open")), "high": number(quote.get("high")), "low": number(quote.get("low")),
+            "amount": number(quote.get("amount")), "netInflow": number(quote.get("netInflow")),
+            "marketCap": number(quote.get("marketCap")), "floatMarketCap": number(quote.get("floatMarketCap")),
+            "turnover": number(quote.get("turnover")), "updatedAt": saved_at, "quoteTradeDate": trade_date,
+            "liveQuote": False, "dataSource": "本地 SQLite 最近完整交易日收盘快照",
+            "macdSelectionRules": rules, "macdSlowRedDays": red_days,
+            "macdFastRedDays": fast_red_days,
+            "macdThreeDayGain": three_day_gain,
+            "macdLatestChangePct": latest_change_pct,
+        }
+        selected.append((trade_date, code, "/".join(rules), json.dumps(stock, ensure_ascii=False), saved_at))
+    if not selected:
+        return
+    with open_backtest_db() as connection:
+        # 选股池是派生结果；重建时清掉同一交易日的旧规则命中，避免残留。
+        connection.execute("DELETE FROM macd_screener_members WHERE trade_date=?", (trade_date,))
+        connection.executemany(
+            "INSERT OR REPLACE INTO macd_screener_members(trade_date,code,rule,stock_json,scanned_at) VALUES (?,?,?,?,?)", selected
+        )
+        connection.commit()
+
+
+def get_macd_screener_members() -> Dict[str, Any]:
+    now = datetime.now(CHINA_TZ)
+    trade_date = _macd_screener_trade_date(now)
+    if not is_macd_screener_session(now) and not trade_date:
+        bootstrap_macd_screener_from_local_close()
+        trade_date = _macd_screener_trade_date(now)
+    with open_backtest_db() as connection:
+        rows = connection.execute(
+            "SELECT stock_json,rule,scanned_at FROM macd_screener_members WHERE trade_date=? ORDER BY code", (trade_date,)
+        ).fetchall() if trade_date else []
+    stocks = []
+    scanned_at = ""
+    for raw, rule, saved_at in rows:
+        try:
+            stock = json.loads(raw or "{}")
+            stock["macdSelectionRules"] = str(rule or "").split("/") if rule else []
+            stock["nameInitials"] = stock_name_initials(stock.get("name"))
+            stocks.append(stock)
+            scanned_at = max(scanned_at, str(saved_at or ""))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+    return {"stocks": stocks, "tradeDate": trade_date or None, "updatedAt": scanned_at or None,
+            "source": "本地 SQLite MACD 动态选股池（全市场日线 MACD）"}
+
+
 def macd_axis_direction(closes: List[float], fast_period: int = 10, slow_period: int = 20, signal_period: int = 7) -> Optional[str]:
     """Return a strict MACD 0-axis direction for MA-cross alert confirmation.
 
@@ -2545,16 +3164,8 @@ def macd_axis_direction(closes: List[float], fast_period: int = 10, slow_period:
 
 
 def collect_macd_alert_universe() -> Dict[str, Dict[str, Any]]:
-    """Build the alert universe: whitelist plus independent ETF/科技观察池。"""
+    """Build the alert universe from the independent ETF and 科技 observation pools."""
     universe: Dict[str, Dict[str, Any]] = {}
-    try:
-        whitelist = get_whitelist_stocks()
-        for stock in whitelist.get("stocks") or []:
-            code = str(stock.get("code") or "")
-            if code:
-                universe[code] = {**stock, "alertPool": "白名单"}
-    except (MarketDataError, OSError, TypeError, ValueError, sqlite3.Error):
-        pass
     for code in TECH_POOL_CODES:
         if code in universe:
             continue
@@ -2604,7 +3215,7 @@ def resolve_market_alert_history_trade_date(requested_date: str = "") -> str:
         return requested_date
     now_local = datetime.now(CHINA_TZ)
     today = now_local.strftime("%Y-%m-%d")
-    if is_intraday_alert_session(now_local):
+    if is_alert_scan_session(now_local):
         return today
     with open_backtest_db() as connection:
         row = connection.execute(
@@ -2613,13 +3224,20 @@ def resolve_market_alert_history_trade_date(requested_date: str = "") -> str:
     return str(row[0]) if row and row[0] else today
 
 
-ALERT_SIGNAL_FILTERS = ("lowOpenUp", "highOpenDown", "maDown", "maUp", "macdUp", "macdDown")
+ALERT_SIGNAL_FILTERS = (
+    "lowOpenUp", "lowOpenDown", "highOpenUp", "highOpenDown",
+    "maDown", "maUp", "macdUp", "macdDown", "macdSelectionEnter", "macdSelectionRemove",
+)
 
 
 def classify_market_alert_signal(signal: Any) -> str:
     text = str(signal or "")
     if text.startswith("低开高走"):
         return "lowOpenUp"
+    if text.startswith("低开低走"):
+        return "lowOpenDown"
+    if text.startswith("高开高走"):
+        return "highOpenUp"
     if text.startswith("高开低走"):
         return "highOpenDown"
     if text.startswith("跌至") and "日线" in text:
@@ -2630,7 +3248,66 @@ def classify_market_alert_signal(signal: Any) -> str:
         return "macdUp"
     if text.startswith("MACD 翻绿"):
         return "macdDown"
+    if text == "不符合条件移除":
+        return "macdSelectionRemove"
+    if text in MACD_SELECTION_RULE_LABELS.values():
+        return "macdSelectionEnter"
     return ""
+
+
+def record_macd_screener_lifecycle_alerts(
+    trade_date: str,
+    now: datetime,
+    previous_stocks: Dict[str, Dict[str, Any]],
+    selected_stocks: Dict[str, Dict[str, Any]],
+) -> None:
+    """Persist MACD pool additions/removals as normal top-alert events."""
+    if not is_alert_scan_session(now):
+        return
+    try:
+        with open_backtest_db() as connection:
+            prior_event_count = connection.execute(
+                "SELECT COUNT(*) FROM market_alert_history "
+                "WHERE trade_date=? AND alert_type IN ('macdScreenerEnter','macdScreenerRemove')",
+                (trade_date,),
+            ).fetchone()[0]
+    except sqlite3.Error:
+        return
+    previous_codes = set(previous_stocks)
+    selected_codes = set(selected_stocks)
+    first_alert_window_scan = int(prior_event_count or 0) == 0
+    # 首次进入告警时段时把当前结果作为可见基线，同时也保留从 09:15
+    # 预筛结果中已经失效的成员，确保“进入”和“移除”都不会漏记。
+    entered_codes = selected_codes if first_alert_window_scan else selected_codes - previous_codes
+    removed_codes = previous_codes - selected_codes
+    alert_time = now.strftime("%H:%M:%S")
+    event_suffix = str(time.time_ns())
+
+    for code in sorted(entered_codes):
+        stock = selected_stocks[code]
+        for rule in stock.get("macdSelectionRules") or []:
+            record_market_alert({
+                "id": f"{trade_date}:{code}:macd-screener-enter:{rule}:{event_suffix}",
+                "tradeDate": trade_date, "time": alert_time, "code": code,
+                "name": str(stock.get("name") or code), "board": alert_board_for_code(code),
+                "pool": "MACD选股", "price": number(stock.get("price")),
+                "changePct": number(stock.get("changePct")),
+                "industry": str(stock.get("actualIndustry") or stock.get("industry") or "--"),
+                "alertType": "macdScreenerEnter", "config": f"macd-screener:{rule}",
+                "signal": macd_selection_rule_label(rule), "tone": "red",
+            })
+    for code in sorted(removed_codes):
+        stock = previous_stocks[code]
+        record_market_alert({
+            "id": f"{trade_date}:{code}:macd-screener-remove:{event_suffix}",
+            "tradeDate": trade_date, "time": alert_time, "code": code,
+            "name": str(stock.get("name") or code), "board": alert_board_for_code(code),
+            "pool": "MACD选股", "price": number(stock.get("price")),
+            "changePct": number(stock.get("changePct")),
+            "industry": str(stock.get("actualIndustry") or stock.get("industry") or "--"),
+            "alertType": "macdScreenerRemove", "config": "macd-screener:remove",
+            "signal": "不符合条件移除", "tone": "green",
+        })
 
 
 def get_market_alert_history(
@@ -2690,6 +3367,22 @@ def get_market_alert_history(
     total = len(rows)
     start = (page - 1) * page_size
     rows = rows[start:start + page_size]
+    # 收盘后优先使用该交易日已归档的收盘快照；盘中尚无收盘快照时，保留
+    # 告警发生时的行情，保证告警池无需等待收盘也可正常展示。
+    close_quotes: Dict[str, Dict[str, Any]] = {}
+    codes_on_page = list(dict.fromkeys(str(row[3] or "") for row in rows if re.fullmatch(r"\d{6}", str(row[3] or ""))))
+    if codes_on_page:
+        placeholders = ",".join("?" for _ in codes_on_page)
+        with open_backtest_db() as connection:
+            quote_rows = connection.execute(
+                f"SELECT code,quote_json FROM daily_close_quotes WHERE trade_date=? AND code IN ({placeholders})",
+                (trade_date, *codes_on_page),
+            ).fetchall()
+        for code, raw_quote in quote_rows:
+            try:
+                close_quotes[str(code)] = json.loads(raw_quote or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
     items = []
     for row in rows:
         signals = []
@@ -2697,9 +3390,18 @@ def get_market_alert_history(
             signals = json.loads(row[14] or "[]")
         except (TypeError, json.JSONDecodeError):
             signals = []
+        price = number(row[7])
+        change_pct = number(row[8])
+        closing_quote = close_quotes.get(str(row[3]) or "") or {}
+        close_price = number(closing_quote.get("price"))
+        close_change_pct = number(closing_quote.get("changePct"))
+        if close_price is None:
+            # 盘中还没有收盘快照：显示告警时价格，后续收盘归档后自动替换。
+            close_price = price
+            close_change_pct = change_pct
         items.append({
             "id": row[0], "tradeDate": row[1], "time": row[2], "code": row[3], "name": row[4],
-            "board": row[5], "pool": row[6], "price": row[7], "changePct": row[8], "industry": row[9],
+            "board": row[5], "pool": row[6], "price": price, "changePct": change_pct, "closePrice": close_price, "closeChangePct": close_change_pct, "industry": row[9],
             "alertType": row[10], "config": row[11], "signal": row[12], "tone": row[13], "signals": signals,
         })
     return {"tradeDate": trade_date, "rows": items, "total": total, "page": page, "pageSize": page_size, "pages": max(1, math.ceil(total / page_size)), "signalCounts": signal_counts}
@@ -2719,7 +3421,7 @@ def scan_macd_alerts() -> None:
     """Detect alert signals for the whitelist and independent ETF universe."""
     now_local = datetime.now(CHINA_TZ)
     # 顶部告警是盘中信号；收盘后或开盘前的行情缓存不可用于产生新事件。
-    if not is_intraday_alert_session(now_local):
+    if not is_alert_scan_session(now_local):
         return
     trade_date = now_local.strftime("%Y-%m-%d")
     with _cache_lock:
@@ -2730,6 +3432,16 @@ def scan_macd_alerts() -> None:
         universe = collect_macd_alert_universe()
         if not universe:
             return
+        # 服务重启或某个固定菜单首次预热时，内存中的首轮状态会丢失；以当天
+        # 已保存的价格档位事件去重，首轮达到首档也必须补记，不能再静默跳过。
+        with open_backtest_db() as connection:
+            existing_open_move_configs = {
+                (str(code), str(config))
+                for code, config in connection.execute(
+                    "SELECT code,config FROM market_alert_history WHERE trade_date=? AND alert_type='openMove'",
+                    (trade_date,),
+                ).fetchall()
+            }
 
         # 一次性获取全市场实时报价，再复用个股缓存中的日线历史。若对每只
         # 股票分别拉取实时行情，千余只告警池会让一次扫描拖成数分钟，信号必然
@@ -2814,11 +3526,18 @@ def scan_macd_alerts() -> None:
                             previous_level = move_state.get(move[0]) if move else None
                             if move:
                                 move_state[move[0]] = max(previous_level if previous_level is not None else -1, move[1])
-                        # 首轮只建立当前所处档位，避免服务重启后把此前已发生的
-                        # 阈值全部补报；只有随后新跨越一档才产生实时告警。
-                        if move and previous_level is not None and move[1] > previous_level:
-                            direction = "↑" if price > opening else "↓" if price < opening else "--"
+                        if move:
                             label, _, threshold, wording = move
+                            move_config = f"open:{label}:{move[1]}"
+                            # 首次识别到已到达首档（如低开低走 -3%）同样是有效
+                            # 告警；数据库去重使重启或后续轮询不会重复写入。
+                            should_record = previous_level is None or move[1] > previous_level
+                            already_recorded = (code, move_config) in existing_open_move_configs
+                        else:
+                            should_record = False
+                            already_recorded = False
+                        if move and should_record and not already_recorded:
+                            direction = "↑" if price > opening else "↓" if price < opening else "--"
                             tone = "red" if label == "up" else "green"
                             event = {
                                 "id": f"{trade_date}:{code}:open:{label}:{move[1]}:{time.time_ns()}",
@@ -2832,13 +3551,14 @@ def scan_macd_alerts() -> None:
                                 "board": "growth" if re.match(r"^(300|301)", code) else "starBse" if re.match(r"^(688|689|4|8|92)", code) else "main",
                                 "pool": stock.get("alertPool") or "白名单",
                                 "alertType": "openMove",
-                                "config": f"open:{label}:{move[1]}",
+                                "config": move_config,
                                 "direction": direction,
                                 "signal": f"{wording}至{threshold:+.0f}%",
                                 "tone": tone,
                                 "time": datetime.now(CHINA_TZ).strftime("%H:%M:%S"),
                             }
                             record_market_alert(event)
+                            existing_open_move_configs.add((code, move_config))
                 history = quote.get("history") or []
                 # 日线 MACD 的唯一口径：截至昨日的日线收盘价 + 本轮实时价格
                 # 作为今日尚未收盘的唯一一根日 K。剔除缓存中可能带有的“今日”
@@ -2935,7 +3655,7 @@ def scan_macd_alerts() -> None:
 
 
 def start_macd_alert_scan(force: bool = False) -> None:
-    if not is_intraday_alert_session(datetime.now(CHINA_TZ)):
+    if not is_alert_scan_session(datetime.now(CHINA_TZ)):
         return
     with _cache_lock:
         stale = time.monotonic() - float(_macd_scan_status.get("lastStartedAt") or 0) >= 30
@@ -2949,16 +3669,16 @@ def get_macd_alerts(force_refresh: bool = False) -> Dict[str, Any]:
     now_local = datetime.now(CHINA_TZ)
     trade_date = now_local.strftime("%Y-%m-%d")
     # 开盘前出现的“当日”告警必然来自错误缓存或服务重启后的误扫描，直接清理。
-    if not is_intraday_alert_session(now_local) and now_local.hour < 9:
+    if not is_alert_scan_session(now_local) and (now_local.hour < 9 or (now_local.hour == 9 and now_local.minute < 30)):
         with _cache_lock:
             _macd_alert_events[:] = [
                 event for event in _macd_alert_events
-                if event.get("tradeDate") != trade_date or str(event.get("time") or "") >= "09:25:00"
+                if event.get("tradeDate") != trade_date or str(event.get("time") or "") >= "09:30:00"
             ]
         with open_backtest_db() as connection:
             connection.execute(
                 "DELETE FROM market_alert_history WHERE trade_date=? AND alert_time < ?",
-                (trade_date, "09:25:00"),
+                (trade_date, "09:30:00"),
             )
             connection.commit()
     else:
@@ -3810,16 +4530,42 @@ def persist_completed_close_quote(stock: Dict[str, Any]) -> None:
 
 _list_quote_lock = threading.Lock()
 _list_quote_cache: Dict[str, Any] = {}
+_quote_provider_health: Dict[str, Dict[str, float]] = {
+    "tencent": {"failures": 0.0, "open_until": 0.0},
+    "eastmoney": {"failures": 0.0, "open_until": 0.0},
+}
 
 
-def hydrate_list_quotes(payload: Dict[str, Any]) -> Dict[str, Any]:
+def quote_provider_available(provider: str) -> bool:
+    """Short circuit breaker for list quote providers.
+
+    A source that has timed out repeatedly is skipped briefly.  This keeps a
+    failed provider from consuming every menu refresh while the other source
+    can still serve the visible list.
+    """
+    with _cache_lock:
+        return time.monotonic() >= _quote_provider_health.get(provider, {}).get("open_until", 0.0)
+
+
+def record_quote_provider_result(provider: str, success: bool) -> None:
+    with _cache_lock:
+        status = _quote_provider_health.setdefault(provider, {"failures": 0.0, "open_until": 0.0})
+        if success:
+            status.update({"failures": 0.0, "open_until": 0.0})
+            return
+        status["failures"] = status.get("failures", 0.0) + 1.0
+        if status["failures"] >= 2:
+            status["open_until"] = time.monotonic() + min(120.0, 20.0 * status["failures"])
+
+
+def hydrate_list_quotes(payload: Dict[str, Any], *, fetch_if_cache_missing: bool = False) -> Dict[str, Any]:
     """Refresh known members in batches; persist dated quotes independently of membership."""
     now_local = datetime.now(CHINA_TZ)
     intraday = is_intraday_alert_session(now_local)
     # 收盘后允许腾讯批量接口补一遍当日最终报价；开盘前则不再请求实时源，
     # 只使用已落库的最近交易日快照，避免把盘前报价误当成新交易日数据。
     post_close = now_local.weekday() < 5 and now_local.hour >= 15
-    if not intraday and not post_close:
+    if not intraday and not post_close and not fetch_if_cache_missing:
         return payload
     stocks = payload.get("stocks") or []
     codes = sorted({str(s["code"]) for s in stocks if re.fullmatch(r"\d{6}", str(s.get("code", "")))})
@@ -3830,13 +4576,20 @@ def hydrate_list_quotes(payload: Dict[str, Any]) -> Dict[str, Any]:
     if post_close and codes:
         try:
             with open_backtest_db() as db:
+                placeholders = ",".join("?" for _ in codes)
                 snapshot_rows = db.execute(
-                    "SELECT code,quote_json FROM daily_close_quotes "
-                    "WHERE trade_date=(SELECT MAX(trade_date) FROM daily_close_quotes WHERE trade_date<=?)",
-                    (now_local.date().isoformat(),),
+                    f"SELECT code,trade_date,quote_json FROM daily_close_quotes "
+                    f"WHERE code IN ({placeholders}) AND trade_date<=? "
+                    f"ORDER BY code,trade_date DESC",
+                    (*codes, now_local.date().isoformat()),
                 ).fetchall()
                 concepts = dict(db.execute("SELECT code,concepts_json FROM stock_concept_cache"))
-            close_quotes = {str(code): json.loads(raw) for code, raw in snapshot_rows}
+            close_quotes: Dict[str, Dict[str, Any]] = {}
+            for code, _trade_date, raw in snapshot_rows:
+                code = str(code)
+                if code in close_quotes:
+                    continue
+                close_quotes[code] = json.loads(raw)
             # 停牌股的收盘价可能为 0/空，但只要该交易日已有归档就视为缓存
             # 命中，不能为它反复发起第三方请求。
             complete_snapshot = all(
@@ -3869,9 +4622,18 @@ def hydrate_list_quotes(payload: Dict[str, Any]) -> Dict[str, Any]:
         with open_backtest_db() as db:
             db.execute("CREATE TABLE IF NOT EXISTS list_quote_cache (code TEXT PRIMARY KEY, quote_json TEXT NOT NULL)")
             quotes = {code: json.loads(raw) for code, raw in db.execute("SELECT code,quote_json FROM list_quote_cache")}
-        due = [code for code in codes if code not in _list_quote_cache or time.monotonic() - _list_quote_cache[code] >= 10]
+        expected_trade_date = now_local.date().isoformat()
+        # 开盘后，昨日缓存无论何时写入都不是有效实时报价，必须进入本轮批量刷新。
+        due = [
+            code for code in codes
+            if code not in _list_quote_cache
+            or time.monotonic() - _list_quote_cache[code] >= 10
+            or (intraday and str((quotes.get(code) or {}).get("quoteTradeDate") or "") != expected_trade_date)
+        ]
 
         def batch(group):
+            if not quote_provider_available("tencent"):
+                return {}
             url = TENCENT_BATCH_QUOTE_URL + ",".join(tencent_quote_symbol(code) for code in group)
             try:
                 response = subprocess.run(["curl", "-fsSL", "--connect-timeout", "2", "--max-time", "4", url],
@@ -3895,18 +4657,56 @@ def hydrate_list_quotes(payload: Dict[str, Any]) -> Dict[str, Any]:
                         quoteTime=stamp.isoformat(), quoteTradeDate=stamp.date().isoformat(),
                         quoteSource="腾讯行情收盘快照" if post_close else "腾讯行情",
                         liveQuote=intraday)
+                record_quote_provider_result("tencent", bool(result))
                 return result
             except (OSError, ValueError, MarketDataError, subprocess.SubprocessError):
+                record_quote_provider_result("tencent", False)
                 return {}
 
-        with ThreadPoolExecutor(max_workers=6) as executor:
-            for result in executor.map(batch, [due[i:i+80] for i in range(0, len(due), 80)]):
-                for code, quote in result.items():
-                    if quote["quoteTime"] >= quotes.get(code, {}).get("quoteTime", ""):
-                        quotes[code] = quote
+        def eastmoney_metadata_batch(group):
+            if not quote_provider_available("eastmoney"):
+                return {}
+            try:
+                secids = ",".join(("1" if code.startswith(("5", "6", "9")) else "0") + "." + code for code in group)
+                payload = request_json_fast(EASTMONEY_STOCK_QUOTE_URL, {
+                    "fltt": 2, "invt": 2,
+                    "fields": "f2,f3,f8,f12,f14,f20,f21,f62,f100",
+                    "secids": secids, "_": int(time.time()),
+                })
+                result = {
+                    str(row.get("f12")): {
+                        "name": str(row.get("f14") or ""), "price": number(row.get("f2")),
+                        "changePct": number(row.get("f3")), "turnover": number(row.get("f8")),
+                        "netInflow": number(row.get("f62")), "marketCap": number(row.get("f20")),
+                        "floatMarketCap": number(row.get("f21")), "industry": str(row.get("f100") or "").strip(),
+                    }
+                    for row in ((payload.get("data") or {}).get("diff") or [])
+                    if str(row.get("f12") or "") in group
+                }
+                record_quote_provider_result("eastmoney", bool(result))
+                return result
+            except (MarketDataError, OSError, TypeError, ValueError):
+                record_quote_provider_result("eastmoney", False)
+                return {}
+
+        groups = [due[i:i + 80] for i in range(0, len(due), 80)]
+        with ThreadPoolExecutor(max_workers=min(8, max(1, len(groups) * 2))) as executor:
+            futures = {executor.submit(batch, group): "quote" for group in groups}
+            futures.update({executor.submit(eastmoney_metadata_batch, group): "metadata" for group in groups})
+            for future in as_completed(futures):
+                result = future.result()
+                if futures[future] == "quote":
+                    for code, quote in result.items():
+                        if quote["quoteTime"] >= quotes.get(code, {}).get("quoteTime", ""):
+                            quotes[code] = quote
+                else:
+                    for code, metadata in result.items():
+                        current = quotes.get(code)
+                        if current:
+                            current.update({key: value for key, value in metadata.items() if value not in (None, "")})
+                            current["quoteSource"] = f'{current.get("quoteSource") or "腾讯行情"} + 东方财富扩展字段'
         # 腾讯批量接口偶尔只缺少少量证券。只为这些漏项并发请求东财单股
         # 快照，不重试整批，既减少延迟也避免列表出现价格/涨跌幅为 --。
-        expected_trade_date = datetime.now(CHINA_TZ).date().isoformat()
         def complete_realtime_quote(quote: Dict[str, Any]) -> bool:
             return (
                 str(quote.get("quoteTradeDate") or "") == expected_trade_date
@@ -4004,15 +4804,50 @@ def hydrate_list_quotes(payload: Dict[str, Any]) -> Dict[str, Any]:
             code = stock.get("code")
             quote = quotes.get(code)
             if quote and (quote.get("quoteFallback") or quote["quoteTradeDate"] >= str(payload.get("tradeDate") or "")):
+                # 部分实时源只提供价格字段，市值/换手率为空。不能用空实时值
+                # 覆盖已归档的收盘快照，否则黑名单会随机显示“--”。
+                cached_metadata = {
+                    key: stock.get(key)
+                    for key in ("marketCap", "floatMarketCap", "turnover", "netInflow")
+                    if stock.get(key) is not None and quote.get(key) is None
+                }
                 if quote["quoteTradeDate"] != payload.get("tradeDate"):
                     stock["netInflow"] = None
                 stock.update(quote)
+                stock.update(cached_metadata)
                 stock["dataUnavailable"] = False
                 stock["nameInitials"] = stock_name_initials(stock["name"])
             if code in concepts:
                 items = json.loads(concepts[code])
                 stock["relatedConcepts"] = [c.get("name") if isinstance(c, dict) else str(c) for c in items]
                 stock["relatedConcepts"] = [c for c in stock["relatedConcepts"] if c and "报预增" not in c]
+        # 市值与换手率属于日终元数据，实时批量源可能不带这几个字段。最后以
+        # 本地最新交易日快照补空值，禁止不完整的实时对象把它们留成 --。
+        try:
+            with open_backtest_db() as db:
+                snapshot_date_row = db.execute(
+                    "SELECT trade_date FROM daily_close_quotes "
+                    "WHERE REPLACE(trade_date, '-', '')<=? "
+                    "ORDER BY REPLACE(trade_date, '-', '') DESC LIMIT 1",
+                    (now_local.strftime("%Y%m%d"),),
+                ).fetchone()
+                snapshot_date = str(snapshot_date_row[0] or "") if snapshot_date_row else ""
+                if snapshot_date and codes:
+                    placeholders = ",".join("?" for _ in codes)
+                    metadata_rows = db.execute(
+                        f"SELECT code,quote_json FROM daily_close_quotes WHERE trade_date=? AND code IN ({placeholders})",
+                        (snapshot_date, *codes),
+                    ).fetchall()
+                else:
+                    metadata_rows = []
+            snapshot_metadata = {str(code): json.loads(raw or "{}") for code, raw in metadata_rows}
+            for stock in stocks:
+                cached = snapshot_metadata.get(str(stock.get("code") or "")) or {}
+                for key in ("marketCap", "floatMarketCap", "turnover"):
+                    if stock.get(key) is None and cached.get(key) is not None:
+                        stock[key] = cached[key]
+        except (sqlite3.Error, TypeError, ValueError, json.JSONDecodeError):
+            pass
         dates = [s["quoteTradeDate"] for s in stocks if s.get("quoteTradeDate")]
         if dates:
             # 名单归属日与报价交易日可能不同：回退完整名单时必须保留前者。
@@ -4387,6 +5222,49 @@ def fetch_hot_concept_summary(concept_name: str) -> Dict[str, Any]:
     }
 
 
+def fetch_eastmoney_concept_index_quote(board_code: str) -> Dict[str, Any]:
+    """Return the quote for one explicit 东方财富 BK concept index.
+
+    This deliberately reads the board itself (rather than averaging its
+    constituents), so the sidebar reflects the index specified by the UI.
+    """
+    board_code = str(board_code or "").upper().strip()
+    if board_code not in {"BK1128", "BK0877", "BK1660"}:
+        raise MarketDataError("不支持的东方财富概念指数")
+    params = {"secid": f"90.{board_code}", "fields": "f43,f57,f58,f60,f124", "invt": 2}
+    last_error: Optional[Exception] = None
+    for url in (EASTMONEY_CONCEPT_QUOTE_URL, EASTMONEY_CONCEPT_QUOTE_FALLBACK_URL):
+        try:
+            data = (request_json(url, params).get("data") or {})
+            price_raw = number(data.get("f43"))
+            previous_close_raw = number(data.get("f60"))
+            # 东方财富 stock/get 的 f43 / f60 固定以分为单位返回。
+            price = price_raw / 100 if price_raw is not None else None
+            previous_close = previous_close_raw / 100 if previous_close_raw is not None else None
+            if price is None or previous_close in (None, 0):
+                raise MarketDataError("东方财富概念指数报价为空")
+            timestamp = number(data.get("f124"))
+            if timestamp and timestamp > 10_000_000_000:
+                timestamp /= 1000
+            updated_at = None
+            if timestamp:
+                try:
+                    updated_at = datetime.fromtimestamp(timestamp, CHINA_TZ).isoformat()
+                except (OverflowError, OSError, ValueError):
+                    pass
+            return {
+                "code": board_code,
+                "name": str(data.get("f58") or board_code),
+                "price": price,
+                "changePct": round((price - previous_close) / previous_close * 100, 2),
+                "updatedAt": updated_at,
+                "source": "东方财富概念指数",
+            }
+        except MarketDataError as exc:
+            last_error = exc
+    raise MarketDataError(str(last_error or "东方财富概念指数报价不可用"))
+
+
 def get_hot_concept_summaries(names: List[str], force_refresh: bool = False) -> List[Dict[str, Any]]:
     results: Dict[str, Dict[str, Any]] = {}
     pending: List[str] = []
@@ -4638,13 +5516,23 @@ def get_industry_blacklist(local_only: bool = True) -> Dict[str, Any]:
                 (fallback_date,),
             ).fetchall() if fallback_date else []
             latest_close = connection.execute(
-                "SELECT MAX(trade_date) FROM daily_close_quotes WHERE trade_date<=?",
+                "SELECT trade_date FROM daily_close_quotes WHERE trade_date<=? "
+                "GROUP BY trade_date HAVING COUNT(*)>=4000 "
+                "ORDER BY REPLACE(trade_date, '-', '') DESC LIMIT 1",
                 (datetime.now(CHINA_TZ).date().isoformat(),),
             ).fetchone()
             close_date = str(latest_close[0] or "") if latest_close else ""
             close_rows = connection.execute(
                 "SELECT code,quote_json FROM daily_close_quotes WHERE trade_date=?", (close_date,)
             ).fetchall() if close_date else []
+        # 黑名单展示需要流通市值和换手率。收盘快照中缺少这两项时，仅首次
+        # 读取补齐并写回 SQLite；之后全部分页直接命中本地缓存。
+        if close_date:
+            hydrate_close_snapshot_metadata(close_date, [str(code or "") for code, *_ in rows_db])
+            with open_backtest_db() as connection:
+                close_rows = connection.execute(
+                    "SELECT code,quote_json FROM daily_close_quotes WHERE trade_date=?", (close_date,)
+                ).fetchall()
         # 黑名单表本身只存判定结果，不存行情字段。主行情接口失败时，
         # 用最近一次已完成扫描日的 Tushare 全市场日线补齐收盘价、涨跌幅和成交额，
         # 避免页面只剩下名称和原因。Tushare 失败时仍保留原有本地兜底。
@@ -4704,9 +5592,9 @@ def get_industry_blacklist(local_only: bool = True) -> Dict[str, Any]:
                 "price": daily.get("price"),
                 "changePct": daily.get("changePct"),
                 "netInflow": None,
-                "marketCap": None,
-                "floatMarketCap": None,
-                "turnover": None,
+                "marketCap": daily.get("marketCap"),
+                "floatMarketCap": daily.get("floatMarketCap"),
+                "turnover": daily.get("turnover"),
                 "amount": daily.get("amount"),
                 "industry": industry or "--",
                 "actualIndustry": industry or "--",
@@ -4726,9 +5614,9 @@ def get_industry_blacklist(local_only: bool = True) -> Dict[str, Any]:
                 "price": daily.get("price"),
                 "changePct": daily.get("changePct"),
                 "netInflow": None,
-                "marketCap": None,
-                "floatMarketCap": None,
-                "turnover": None,
+                "marketCap": daily.get("marketCap"),
+                "floatMarketCap": daily.get("floatMarketCap"),
+                "turnover": daily.get("turnover"),
                 "amount": daily.get("amount"),
                 "industry": "--",
                 "actualIndustry": "--",
@@ -4743,6 +5631,13 @@ def get_industry_blacklist(local_only: bool = True) -> Dict[str, Any]:
             "fallback": True,
             "stocks": stocks,
         })
+        # hydrate_list_quotes 在盘前会直接返回；黑名单仍必须带出本地收盘快照
+        # 已保存的流通市值和换手率，不能依赖它的后续合并分支。
+        for stock in result_payload.get("stocks", []):
+            cached = daily_snapshot.get(str(stock.get("code") or "")) or {}
+            for key in ("marketCap", "floatMarketCap", "turnover"):
+                if stock.get(key) is None and cached.get(key) is not None:
+                    stock[key] = cached[key]
         # 无论快照最初由哪家行情源写入，只要本次读取来自归档库，页面必须
         # 明确展示本地 SQLite，避免误解为每次都在请求腾讯。
         if daily_snapshot:
@@ -6307,6 +7202,12 @@ def open_backtest_db() -> sqlite3.Connection:
         PRIMARY KEY (trade_date, code)
     )""")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_daily_close_quotes_code_date ON daily_close_quotes(code, trade_date DESC)")
+    connection.execute("""CREATE TABLE IF NOT EXISTS macd_screener_members (
+        trade_date TEXT NOT NULL, code TEXT NOT NULL, rule TEXT NOT NULL,
+        stock_json TEXT NOT NULL, scanned_at TEXT NOT NULL,
+        PRIMARY KEY (trade_date, code)
+    )""")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_macd_screener_date ON macd_screener_members(trade_date, code)")
     connection.execute("""CREATE TABLE IF NOT EXISTS a_share_trading_calendar (
         trade_date TEXT PRIMARY KEY, is_open INTEGER NOT NULL,
         source TEXT NOT NULL, updated_at TEXT NOT NULL
@@ -7716,12 +8617,37 @@ class AppHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/data-policy":
             self.send_json(200, get_market_data_policy())
             return
+        if parsed.path == "/api/macd-screener":
+            try:
+                if query.get("refresh") == ["1"]:
+                    start_macd_screener_scan()
+                self.send_json(200, get_macd_screener_members())
+            except (MarketDataError, OSError, ValueError, sqlite3.Error) as exc:
+                self.send_json(502, {"error": str(exc) or "MACD选股读取失败"})
+            return
         if parsed.path == "/api/menu-members":
             try:
                 codes = list(dict.fromkeys(code.strip() for code in query.get("codes", [""])[0].split(",") if code.strip()))
                 self.send_json(200, get_menu_members(query.get("menu", [""])[0], codes))
             except (ValueError, sqlite3.Error, json.JSONDecodeError) as exc:
                 self.send_json(400, {"error": str(exc) or "菜单成员读取失败"})
+            return
+        if parsed.path == "/api/menu-quotes":
+            try:
+                codes = list(dict.fromkeys(code.strip() for code in query.get("codes", [""])[0].split(",") if code.strip()))
+                self.send_json(200, get_menu_quote_batch(query.get("menu", [""])[0], codes))
+            except (ValueError, sqlite3.Error, json.JSONDecodeError, MarketDataError, OSError) as exc:
+                self.send_json(400, {"error": str(exc) or "批量报价读取失败"})
+            return
+        if parsed.path == "/api/chart-history":
+            code = query.get("code", [""])[0]
+            payload = get_cached_chart_history(code)
+            if payload is None:
+                # 缓存未命中是正常路径，前端会安静回退到多源详情接口；不能
+                # 用 404 污染控制台，更不能让缩略图误判为服务异常。
+                self.send_json(200, {"quote": None, "cached": False})
+            else:
+                self.send_json(200, {"quote": payload, "cached": True})
             return
         if parsed.path == "/api/whitelist-labels":
             self.send_json(200, {"labels": get_whitelist_label_overrides()})
@@ -8030,6 +8956,25 @@ class AppHandler(BaseHTTPRequestHandler):
                 "concepts": get_hot_concept_summaries(names, query.get("refresh") == ["1"]),
             })
             return
+        if parsed.path == "/api/concept-index-quote":
+            board_code = query.get("code", [""])[0].strip()
+            with _cache_lock:
+                cached = _concept_index_quote_cache.get(board_code.upper())
+            if cached and time.monotonic() - cached["created_at"] < DYNAMIC_CACHE_TTL_SECONDS:
+                self.send_json(200, {"quote": cached["payload"], "cached": True})
+                return
+            try:
+                quote = fetch_eastmoney_concept_index_quote(board_code)
+                with _cache_lock:
+                    _concept_index_quote_cache[board_code.upper()] = {"created_at": time.monotonic(), "payload": quote}
+                self.send_json(200, {"quote": quote, "cached": False})
+            except MarketDataError as exc:
+                # 短暂网络失败时继续展示上一次成功的概念指数，菜单不出现空白。
+                if cached:
+                    self.send_json(200, {"quote": cached["payload"], "cached": True, "stale": True})
+                else:
+                    self.send_json(502, {"error": str(exc)})
+            return
         if parsed.path == "/api/midterm":
             self.send_json(200, get_midterm_pool(query.get("refresh") == ["1"]))
             return
@@ -8056,10 +9001,19 @@ class AppHandler(BaseHTTPRequestHandler):
                 # 成员与报价仍在服务端统一生成，保证每页使用同一交易日快照。
                 try:
                     page = max(1, int(query.get("page", ["1"])[0]))
-                    page_size = min(300, max(50, int(query.get("pageSize", ["100"])[0])))
+                    page_size = min(500, max(50, int(query.get("pageSize", ["500"])[0])))
                 except (TypeError, ValueError):
-                    page, page_size = 1, 100
-                all_stocks = payload.get("stocks") or []
+                    page, page_size = 1, 500
+                # 必须先对完整黑名单排序、再分页；否则前端只能把当前 500 只
+                # 排序，下一页会重新从未排序的源数据开始，无法保持全局降序。
+                all_stocks = sorted(
+                    payload.get("stocks") or [],
+                    key=lambda stock: (
+                        number(stock.get("changePct")) is not None,
+                        number(stock.get("changePct")) if number(stock.get("changePct")) is not None else float("-inf"),
+                    ),
+                    reverse=True,
+                )
                 total = len(all_stocks)
                 start = (page - 1) * page_size
                 payload["stocks"] = all_stocks[start:start + page_size]
