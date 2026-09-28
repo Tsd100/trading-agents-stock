@@ -314,7 +314,6 @@ _technology_returns_cache: Dict[str, Dict[str, Any]] = {}
 _stock_name_cache: Dict[str, str] = {}
 _downtrend_history_cache: Dict[str, Dict[str, Any]] = {}
 _daily_blacklist_cache: Dict[str, Dict[str, str]] = {}
-_macd_alert_state: Dict[Tuple[str, str], str] = {}
 _open_move_alert_state: Dict[Tuple[str, ...], Dict[str, Any]] = {}
 _macd_alert_events: List[Dict[str, Any]] = []
 _macd_scan_status: Dict[str, Any] = {"running": False, "lastStartedAt": 0.0, "tradeDate": ""}
@@ -772,9 +771,9 @@ def follow_up_snapshot_loop(stop_event: threading.Event) -> None:
             if alert_session and time.monotonic() - last_macd_alert_scan >= 60:
                 start_macd_alert_scan(force=True)
                 last_macd_alert_scan = time.monotonic()
-            # MACD 选股独立于页面生命周期：交易中每十分钟更新一次，15:00
+            # MACD 选股独立于页面生命周期：交易中每分钟更新一次，15:00
             # 的最后一轮写入当天收盘结果，之后不再触发外部行情请求。
-            if is_macd_screener_session(now) and time.monotonic() - last_macd_screener_scan >= 600:
+            if is_macd_screener_session(now) and time.monotonic() - last_macd_screener_scan >= 60:
                 start_macd_screener_scan(force=True)
                 last_macd_screener_scan = time.monotonic()
             # 已移除的分钟预测与旧版阈值告警不再后台扫描。AI 页面保留按需
@@ -2699,9 +2698,6 @@ def calculate_macd(closes: List[float]) -> Dict[str, Any]:
     return {"available": True, "dif": round(diffs[-1], 4), "dea": round(deas[-1], 4), "histogram": round(histogram, 4), "signal": signal, "bars": [round(value, 4) for value in histograms[-90:]]}
 
 
-MACD_ALERT_CONFIGS: Tuple[Tuple[int, int, int], ...] = ((10, 20, 7), (5, 10, 3))
-
-
 def open_move_alert_level(open_change_pct: float, change_pct: float) -> Optional[Tuple[str, int, float, str]]:
     """Return the next two-point move level measured from the opening anchor.
 
@@ -2723,24 +2719,6 @@ def open_move_alert_level(open_change_pct: float, change_pct: float) -> Optional
         threshold = down_start - index * 2
         return "down", index, threshold, down_text
     return None
-
-
-def macd_color_state(closes: List[float], fast_period: int, slow_period: int, signal_period: int) -> Optional[str]:
-    """Return the histogram color used by the K-line MACD panel."""
-    if len(closes) < slow_period:
-        return None
-
-    def ema(values: List[float], period: int) -> List[float]:
-        alpha = 2 / (period + 1)
-        result = [values[0]]
-        for value in values[1:]:
-            result.append(value * alpha + result[-1] * (1 - alpha))
-        return result
-
-    dif = [fast - slow for fast, slow in zip(ema(closes, fast_period), ema(closes, slow_period))]
-    dea = ema(dif, signal_period)
-    histogram = (dif[-1] - dea[-1]) * 2
-    return "red" if histogram >= 0 else "green"
 
 
 def macd_histogram_series(closes: List[float], fast_period: int, slow_period: int, signal_period: int) -> List[float]:
@@ -2940,7 +2918,7 @@ def start_macd_screener_scan(force: bool = False) -> None:
         return
     with _cache_lock:
         running = bool(_macd_screener_status.get("running"))
-        stale = time.monotonic() - float(_macd_screener_status.get("lastStartedAt") or 0) >= 600
+        stale = time.monotonic() - float(_macd_screener_status.get("lastStartedAt") or 0) >= 60
     if running or (not force and not stale):
         return
     threading.Thread(target=scan_macd_screener, name="macd-screener-scan", daemon=True).start()
@@ -3226,8 +3204,14 @@ def resolve_market_alert_history_trade_date(requested_date: str = "") -> str:
 
 ALERT_SIGNAL_FILTERS = (
     "lowOpenUp", "lowOpenDown", "highOpenUp", "highOpenDown",
-    "maDown", "maUp", "macdUp", "macdDown", "macdSelectionEnter", "macdSelectionRemove",
+    "maDown", "maUp", "macdSelectionEnter", "macdSelectionRemove",
 )
+
+
+def is_disabled_generic_macd_alert_signal(signal: Any) -> bool:
+    """Generic MACD color-flip alerts are retired; selection-pool MACD rules remain."""
+    text = str(signal or "")
+    return text.startswith("MACD 翻红") or text.startswith("MACD 翻绿")
 
 
 def classify_market_alert_signal(signal: Any) -> str:
@@ -3244,10 +3228,6 @@ def classify_market_alert_signal(signal: Any) -> str:
         return "maDown"
     if text.startswith("涨至") and "日线" in text:
         return "maUp"
-    if text.startswith("MACD 翻红"):
-        return "macdUp"
-    if text.startswith("MACD 翻绿"):
-        return "macdDown"
     if text == "不符合条件移除":
         return "macdSelectionRemove"
     if text in MACD_SELECTION_RULE_LABELS.values():
@@ -3310,6 +3290,47 @@ def record_macd_screener_lifecycle_alerts(
         })
 
 
+def ensure_macd_screener_lifecycle_alert_baseline(now: Optional[datetime] = None) -> None:
+    """Backfill the first live MACD pool alert batch when a scan predates alert setup.
+
+    A service restart or a pool rebuilt before the alert writer is available must
+    not leave a populated MACD menu with no corresponding top-alert signals.
+    The guard makes this a one-time operation for each trading day.
+    """
+    current = (now or datetime.now(CHINA_TZ)).astimezone(CHINA_TZ)
+    if not is_alert_scan_session(current):
+        return
+    trade_date = current.date().isoformat()
+    try:
+        with open_backtest_db() as connection:
+            existing = connection.execute(
+                "SELECT COUNT(*) FROM market_alert_history "
+                "WHERE trade_date=? AND alert_type IN ('macdScreenerEnter','macdScreenerRemove')",
+                (trade_date,),
+            ).fetchone()[0]
+            if existing:
+                return
+            rows = connection.execute(
+                "SELECT code,rule,stock_json FROM macd_screener_members WHERE trade_date=?", (trade_date,)
+            ).fetchall()
+    except sqlite3.Error:
+        return
+    selected_stocks: Dict[str, Dict[str, Any]] = {}
+    for code, rules, raw_stock in rows:
+        try:
+            stock = json.loads(raw_stock or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        normalized_code = str(code or stock.get("code") or "")
+        if not re.fullmatch(r"\d{6}", normalized_code):
+            continue
+        stock["code"] = normalized_code
+        stock["macdSelectionRules"] = [item for item in str(rules or "").split("/") if item]
+        selected_stocks[normalized_code] = stock
+    if selected_stocks:
+        record_macd_screener_lifecycle_alerts(trade_date, current, {}, selected_stocks)
+
+
 def get_market_alert_history(
     trade_date: str,
     keyword: str = "",
@@ -3347,6 +3368,8 @@ def get_market_alert_history(
             f"FROM market_alert_history WHERE {where} ORDER BY alert_time ASC, created_at ASC",
             params,
         ).fetchall()
+    # 已停用 MACD 翻红 / 翻绿告警；保留原始审计记录，但在所有告警视图中隐藏。
+    rows = [row for row in rows if not is_disabled_generic_macd_alert_signal(row[12])]
     # 告警历史表没有单独的拼音字段；按交易日读取后用同一套拼音首字母规则匹配，
     # 同时支持代码、中文名称与首字母（如 xhy / 新恒汇）。
     needle = keyword.strip().lower()
@@ -3367,9 +3390,12 @@ def get_market_alert_history(
     total = len(rows)
     start = (page - 1) * page_size
     rows = rows[start:start + page_size]
-    # 收盘后优先使用该交易日已归档的收盘快照；盘中尚无收盘快照时，保留
-    # 告警发生时的行情，保证告警池无需等待收盘也可正常展示。
+    # “最新价 / 最新涨跌幅”必须遵循服务的数据时段准则：连续竞价时批量
+    # 取实时行情，午休读取当日已缓存的最后一笔，收盘后才读取收盘快照。
+    # 绝不能在开盘期间让 daily_close_quotes 覆盖实时行情。
     close_quotes: Dict[str, Dict[str, Any]] = {}
+    intraday_quotes: Dict[str, Dict[str, Any]] = {}
+    cached_quotes: Dict[str, Dict[str, Any]] = {}
     codes_on_page = list(dict.fromkeys(str(row[3] or "") for row in rows if re.fullmatch(r"\d{6}", str(row[3] or ""))))
     if codes_on_page:
         placeholders = ",".join("?" for _ in codes_on_page)
@@ -3378,11 +3404,36 @@ def get_market_alert_history(
                 f"SELECT code,quote_json FROM daily_close_quotes WHERE trade_date=? AND code IN ({placeholders})",
                 (trade_date, *codes_on_page),
             ).fetchall()
+            cache_rows = connection.execute(
+                f"SELECT code,quote_json FROM list_quote_cache WHERE code IN ({placeholders})",
+                tuple(codes_on_page),
+            ).fetchall()
         for code, raw_quote in quote_rows:
             try:
                 close_quotes[str(code)] = json.loads(raw_quote or "{}")
             except (TypeError, json.JSONDecodeError):
                 continue
+        for code, raw_quote in cache_rows:
+            try:
+                quote = json.loads(raw_quote or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if str(quote.get("quoteTradeDate") or "") == trade_date:
+                cached_quotes[str(code)] = quote
+        if is_intraday_alert_session(datetime.now(CHINA_TZ)):
+            try:
+                live_payload = hydrate_list_quotes(
+                    {"stocks": [{"code": code, "name": code} for code in codes_on_page]},
+                    fetch_if_cache_missing=True,
+                )
+                intraday_quotes = {
+                    str(quote.get("code") or ""): quote
+                    for quote in live_payload.get("stocks") or []
+                    if number(quote.get("price")) is not None
+                }
+            except (MarketDataError, OSError, ValueError, sqlite3.Error, TypeError):
+                # 单个实时源短暂失败时，午休/盘中缓存仍优先于旧收盘快照。
+                intraday_quotes = {}
     items = []
     for row in rows:
         signals = []
@@ -3392,7 +3443,8 @@ def get_market_alert_history(
             signals = []
         price = number(row[7])
         change_pct = number(row[8])
-        closing_quote = close_quotes.get(str(row[3]) or "") or {}
+        code = str(row[3] or "")
+        closing_quote = intraday_quotes.get(code) or cached_quotes.get(code) or close_quotes.get(code) or {}
         close_price = number(closing_quote.get("price"))
         close_change_pct = number(closing_quote.get("changePct"))
         if close_price is None:
@@ -3621,34 +3673,6 @@ def scan_macd_alerts() -> None:
                                 "time": datetime.now(CHINA_TZ).strftime("%H:%M:%S"),
                             }
                             record_market_alert(event)
-                for fast_period, slow_period, signal_period in MACD_ALERT_CONFIGS:
-                    config_key = f"{fast_period},{slow_period},{signal_period}"
-                    current = macd_color_state(closes, fast_period, slow_period, signal_period)
-                    if current is None:
-                        continue
-                    key = (trade_date + ":" + code, config_key)
-                    with _cache_lock:
-                        previous = _macd_alert_state.get(key)
-                        _macd_alert_state[key] = current
-                    if previous is None or previous == current:
-                        continue
-                    event = {
-                        "id": f"{trade_date}:{code}:{config_key}:{time.time_ns()}",
-                        "tradeDate": trade_date,
-                        "code": code,
-                        "name": str(quote.get("name") or stock.get("name") or code).replace("-U", ""),
-                        "price": number(quote.get("price")),
-                        "changePct": number(quote.get("changePct")),
-                        "industry": industry,
-                        "board": "growth" if re.match(r"^(300|301)", code) else "starBse" if re.match(r"^(688|689|4|8|92)", code) else "main",
-                        "pool": stock.get("alertPool") or "白名单",
-                        "alertType": "macd",
-                        "config": config_key,
-                        "signal": f"MACD {'翻红' if current == 'red' else '翻绿'}({fast_period}、{slow_period}、{signal_period})",
-                        "tone": current,
-                        "time": datetime.now(CHINA_TZ).strftime("%H:%M:%S"),
-                    }
-                    record_market_alert(event)
     finally:
         with _cache_lock:
             _macd_scan_status["running"] = False
@@ -3663,6 +3687,44 @@ def start_macd_alert_scan(force: bool = False) -> None:
     if running or (not force and not stale):
         return
     threading.Thread(target=scan_macd_alerts, name="macd-alert-scan", daemon=True).start()
+
+
+def restore_top_alert_events(trade_date: str) -> None:
+    """Rehydrate top-alert memory from today's durable history after a restart."""
+    with _cache_lock:
+        if any(event.get("tradeDate") == trade_date for event in _macd_alert_events):
+            return
+    try:
+        with open_backtest_db() as connection:
+            rows = connection.execute(
+                "SELECT id,trade_date,alert_time,code,name,board,pool,price,change_pct,industry,"
+                "alert_type,config,signal,tone,signals_json "
+                "FROM market_alert_history WHERE trade_date=? "
+                "ORDER BY alert_time DESC, created_at DESC LIMIT 360",
+                (trade_date,),
+            ).fetchall()
+    except sqlite3.Error:
+        return
+    restored: List[Dict[str, Any]] = []
+    for row in reversed(rows):
+        if is_disabled_generic_macd_alert_signal(row[12]):
+            continue
+        try:
+            signals = json.loads(row[14] or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            signals = []
+        restored.append({
+            "id": row[0], "tradeDate": row[1], "time": row[2], "code": row[3], "name": row[4],
+            "board": row[5], "pool": row[6], "price": number(row[7]), "changePct": number(row[8]),
+            "industry": row[9], "alertType": row[10], "config": row[11], "signal": row[12],
+            "tone": row[13], "signals": signals,
+        })
+    if not restored:
+        return
+    with _cache_lock:
+        if not any(event.get("tradeDate") == trade_date for event in _macd_alert_events):
+            _macd_alert_events.extend(restored)
+            del _macd_alert_events[:-360]
 
 
 def get_macd_alerts(force_refresh: bool = False) -> Dict[str, Any]:
@@ -3683,8 +3745,14 @@ def get_macd_alerts(force_refresh: bool = False) -> Dict[str, Any]:
             connection.commit()
     else:
         start_macd_alert_scan(force_refresh)
+        ensure_macd_screener_lifecycle_alert_baseline(now_local)
+    restore_top_alert_events(trade_date)
     with _cache_lock:
-        events = [event for event in _macd_alert_events if event.get("tradeDate") == trade_date]
+        events = [
+            event for event in _macd_alert_events
+            if event.get("tradeDate") == trade_date
+            and not is_disabled_generic_macd_alert_signal(event.get("signal"))
+        ]
         status = dict(_macd_scan_status)
     # 保留当日历史告警供顶部框滚动查看；同一股票、同一秒内的多条信号
     # 仍合并到一个单元格。不能再按股票只保留最后一次，否则历史不可见。
