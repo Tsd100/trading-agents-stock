@@ -3443,6 +3443,7 @@ def get_market_alert_history(
     page_size: int = 50,
     codes: Optional[List[str]] = None,
     signal_filter: str = "",
+    direction_filter: str = "",
 ) -> Dict[str, Any]:
     """Query durable alert events for the alert-pool dialog."""
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", trade_date):
@@ -3455,6 +3456,8 @@ def get_market_alert_history(
     valid_signal_filters = set(ALERT_SIGNAL_FILTERS) | set(MACD_SELECTION_RULE_LABELS.values())
     if signal_filter and signal_filter not in valid_signal_filters:
         raise ValueError("信号筛选参数不正确")
+    if direction_filter and direction_filter not in {"up", "down", "flat"}:
+        raise ValueError("方向筛选参数不正确")
     clauses = ["trade_date=?"]
     params: List[Any] = [trade_date]
     if market != "all":
@@ -3497,6 +3500,31 @@ def get_market_alert_history(
             rows = [row for row in rows if row[10] == "macdScreenerEnter" and str(row[12] or "") == signal_filter]
         else:
             rows = [row for row in rows if classify_market_alert_signal(row[12]) == signal_filter]
+    direction_by_code: Dict[str, str] = {}
+    all_codes = list(dict.fromkeys(str(row[3] or "") for row in rows if re.fullmatch(r"\d{6}", str(row[3] or ""))))
+    if all_codes:
+        placeholders = ",".join("?" for _ in all_codes)
+        with open_backtest_db() as connection:
+            cached = connection.execute(f"SELECT code,quote_json FROM list_quote_cache WHERE code IN ({placeholders})", tuple(all_codes)).fetchall()
+            daily = connection.execute(f"SELECT code,quote_json FROM daily_close_quotes WHERE trade_date=? AND code IN ({placeholders})", (trade_date, *all_codes)).fetchall()
+        latest_by_code: Dict[str, Dict[str, Any]] = {}
+        for code, raw in [*daily, *cached]:
+            try:
+                latest_by_code[str(code)] = json.loads(raw or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+        for row in rows:
+            old_price = number(row[7])
+            new_price = number((latest_by_code.get(str(row[3] or "")) or {}).get("price"))
+            if old_price is not None and new_price is not None:
+                direction_by_code[str(row[3] or "")] = "up" if new_price > old_price else "down" if new_price < old_price else "flat"
+    direction_counts = {"up": 0, "down": 0, "flat": 0}
+    for row in rows:
+        direction = direction_by_code.get(str(row[3] or ""))
+        if direction:
+            direction_counts[direction] += 1
+    if direction_filter:
+        rows = [row for row in rows if direction_by_code.get(str(row[3] or "")) == direction_filter]
     total = len(rows)
     start = (page - 1) * page_size
     rows = rows[start:start + page_size]
@@ -3566,7 +3594,7 @@ def get_market_alert_history(
             "board": row[5], "pool": row[6], "price": price, "changePct": change_pct, "closePrice": close_price, "closeChangePct": close_change_pct, "industry": row[9],
             "alertType": row[10], "config": row[11], "signal": row[12], "tone": row[13], "signals": signals,
         })
-    return {"tradeDate": trade_date, "rows": items, "total": total, "page": page, "pageSize": page_size, "pages": max(1, math.ceil(total / page_size)), "signalCounts": signal_counts}
+    return {"tradeDate": trade_date, "rows": items, "total": total, "page": page, "pageSize": page_size, "pages": max(1, math.ceil(total / page_size)), "signalCounts": signal_counts, "directionCounts": direction_counts}
 
 
 def alert_industry(stock: Dict[str, Any], quote: Dict[str, Any]) -> str:
@@ -9095,6 +9123,7 @@ class AppHandler(BaseHTTPRequestHandler):
                     page_size,
                     codes,
                     query.get("signalType", [""])[0],
+                    query.get("direction", [""])[0],
                 ))
             except (ValueError, sqlite3.Error) as exc:
                 self.send_json(400, {"error": str(exc) or "告警历史读取失败"})

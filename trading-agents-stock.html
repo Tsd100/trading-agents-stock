@@ -3284,6 +3284,7 @@
       <div class="market-alert-history-controls">
         <input id="marketAlertHistorySearch" type="search" placeholder="搜索名称、代码或首字母" aria-label="搜索告警股票，支持首字母">
         <select id="marketAlertHistoryMarket" aria-label="筛选告警市场"><option value="all">全部市场</option><option value="main">主板</option><option value="chinext">创业板</option><option value="starBse">科创板 / 北交所</option></select>
+        <select id="marketAlertHistoryDirection" aria-label="筛选告警方向"><option value="">全部方向</option></select>
         <select id="marketAlertHistorySignal" aria-label="筛选 MACD 指标"><option value="">全部 MACD指标</option></select>
       </div>
       <div class="alert-pool-body market-alert-history-body" id="marketAlertHistoryBody"><div class="alert-pool-empty">正在读取当日告警…</div></div>
@@ -3718,6 +3719,7 @@
       marketAlertHistoryMeta: document.getElementById("marketAlertHistoryMeta"),
       marketAlertHistorySearch: document.getElementById("marketAlertHistorySearch"),
       marketAlertHistoryMarket: document.getElementById("marketAlertHistoryMarket"),
+      marketAlertHistoryDirection: document.getElementById("marketAlertHistoryDirection"),
       marketAlertHistorySignal: document.getElementById("marketAlertHistorySignal"),
       previewPriceAlertsBtn: document.getElementById("previewPriceAlertsBtn"),
       resetBtn: document.getElementById("resetBtn"),
@@ -8441,6 +8443,14 @@
       el.marketAlertHistorySignal.value = selected;
     }
 
+    function syncMarketAlertDirectionOptions(counts = {}) {
+      const selected = el.marketAlertHistoryDirection.value;
+      const labels = { up: "↑", down: "↓", flat: "--" };
+      const total = Object.values(counts).reduce((sum, count) => sum + Number(count || 0), 0);
+      el.marketAlertHistoryDirection.innerHTML = `<option value="">全部方向 (${total})</option>${Object.entries(labels).map(([key, label]) => `<option value="${key}">${label} (${Number(counts[key] || 0)})</option>`).join("")}`;
+      el.marketAlertHistoryDirection.value = selected;
+    }
+
     function currentMenuAlertScope() {
       if (state.pageView === "etf-basket") {
         const basket = ETF_BASKETS[state.etfBasketKey] || {};
@@ -8491,7 +8501,7 @@
       const footer = el.marketAlertHistoryBody.querySelector(".market-alert-load-more");
       if (footer) footer.textContent = "正在加载…";
       try {
-        const params = new URLSearchParams({ page: String(view.page + 1), pageSize: "50", q: el.marketAlertHistorySearch.value.trim(), market: el.marketAlertHistoryMarket.value, signalType: el.marketAlertHistorySignal.value });
+        const params = new URLSearchParams({ page: String(view.page + 1), pageSize: "50", q: el.marketAlertHistorySearch.value.trim(), market: el.marketAlertHistoryMarket.value, direction: el.marketAlertHistoryDirection.value, signalType: el.marketAlertHistorySignal.value });
         const scope = currentMenuAlertScope();
         if (scope.codes.length) params.set("codes", scope.codes.join(","));
         const response = await fetch(`/api/market-alert-history?${params}`, { cache: "no-store" });
@@ -8499,7 +8509,10 @@
         if (!response.ok) throw new Error(payload.error || "告警历史读取失败");
         const tbody = el.marketAlertHistoryBody.querySelector("tbody");
         const rows = payload.rows || [];
-        if (reset) syncMarketAlertSignalOptions(payload.signalCounts || {});
+        if (reset) {
+          syncMarketAlertDirectionOptions(payload.directionCounts || {});
+          syncMarketAlertSignalOptions(payload.signalCounts || {});
+        }
         if (!rows.length && reset) {
           el.marketAlertHistoryBody.innerHTML = '<div class="alert-pool-empty">当日暂未保存告警</div>';
         } else if (tbody) {
@@ -8614,6 +8627,7 @@
       marketAlertHistorySearchTimer = window.setTimeout(() => loadMarketAlertHistory(true), 220);
     });
     el.marketAlertHistoryMarket.addEventListener("change", () => loadMarketAlertHistory(true));
+    el.marketAlertHistoryDirection.addEventListener("change", () => loadMarketAlertHistory(true));
     el.marketAlertHistorySignal.addEventListener("change", () => loadMarketAlertHistory(true));
 
     el.resetBtn.addEventListener("click", () => {
