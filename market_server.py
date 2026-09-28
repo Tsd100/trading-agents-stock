@@ -3228,6 +3228,10 @@ def collect_macd_alert_universe() -> Dict[str, Dict[str, Any]]:
 
 def record_market_alert(event: Dict[str, Any]) -> None:
     """Keep the in-page alert stream and a durable same-day alert audit trail."""
+    # 告警系统现在只服务 MACD 选股规则；开高低走、涨跌幅档位和均线触达
+    # 仍可作为内部行情判断，但不再进入顶部告警框或当日告警池。
+    if str(event.get("alertType") or "") != "macdScreenerEnter":
+        return
     with _cache_lock:
         _macd_alert_events.append(event)
         del _macd_alert_events[:-360]
@@ -3477,7 +3481,11 @@ def get_market_alert_history(
             params,
         ).fetchall()
     # 已停用 MACD 翻红 / 翻绿告警；保留原始审计记录，但在所有告警视图中隐藏。
-    rows = [row for row in rows if not is_disabled_generic_macd_alert_signal(row[12])]
+    rows = [
+        row for row in rows
+        if row[10] == "macdScreenerEnter"
+        and not is_disabled_generic_macd_alert_signal(row[12])
+    ]
     # 告警历史表没有单独的拼音字段；按交易日读取后用同一套拼音首字母规则匹配，
     # 同时支持代码、中文名称与首字母（如 xhy / 新恒汇）。
     needle = keyword.strip().lower()
@@ -3911,6 +3919,7 @@ def get_macd_alerts(force_refresh: bool = False) -> Dict[str, Any]:
         events = [
             event for event in _macd_alert_events
             if event.get("tradeDate") == trade_date
+            and event.get("alertType") == "macdScreenerEnter"
             and not is_disabled_generic_macd_alert_signal(event.get("signal"))
         ]
         status = dict(_macd_scan_status)

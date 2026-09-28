@@ -398,6 +398,7 @@
     .market-alert-history-head .alert-pool-table { margin:0; }
     .market-alert-history-grid { table-layout:fixed; }
     .market-alert-history-grid th, .market-alert-history-grid td { overflow:hidden; text-overflow:ellipsis; }
+    .market-alert-history-macd { display:inline-flex; width:82px; height:28px; align-items:center; justify-content:center; }
     .market-alert-history-scroll { flex:1 1 auto; min-height:0; overflow:auto; scrollbar-gutter:stable; padding:0 22px 22px; }
     .market-alert-history-scroll .alert-pool-table { margin:0; }
     .market-alert-signal { white-space:pre-line; line-height:1.45; font-weight:700; }
@@ -2931,24 +2932,10 @@
         <span>实时选股与板块研究</span>
       </div>
       <nav class="nav-list" aria-label="市场范围导航">
-        <button class="nav-button" id="indexAnalysisNav" type="button">
-          <span>指数分析</span><span class="nav-count">实时</span>
-        </button>
-        <button class="nav-button" id="conceptRankNav" type="button"><span>概念排行</span><span class="nav-count">涨幅</span></button>
-        <button class="nav-button" id="midtermNav" type="button">
-          <span>中期选股</span><span class="nav-count">全市场</span>
-        </button>
         <button class="nav-button" id="sectorToggle" type="button" aria-expanded="true" aria-controls="sectorNav">
           <span>盘中选股</span><span class="nav-count" id="sectorTotal">5</span>
         </button>
         <div class="nav-submenu" id="sectorNav"></div>
-        <button class="nav-button" id="hotSectorNav" type="button" aria-expanded="false" aria-controls="hotSectorGroups">
-          <span>热门板块</span><span class="nav-count">概念</span>
-        </button>
-        <div class="hot-sector-groups" id="hotSectorGroups" hidden></div>
-        <button class="nav-button" id="sectorStrengthNav" type="button">
-          <span>板块强度</span><span class="nav-count">今日</span>
-        </button>
       </nav>
       <div class="nav-foot">每次仅扫描所选市场的实时快照。入选候选在打开图表时按需加载历史 K 线。<input id="previewPriceAlertsToggle" type="checkbox" hidden><label class="btn" id="previewPriceAlertsBtn" for="previewPriceAlertsToggle" aria-label="预览告警样式">预览告警样式</label></div>
       <script>
@@ -5241,7 +5228,9 @@
       el.whitelistUpdated.textContent = "正在读取 MACD 动态选股池…";
       renderSectorNavigation(); render();
       try {
-        const params = new URLSearchParams({quotes:"1"});
+        // 先读取本地选股池并立即渲染；不要让全量实时行情补齐阻塞整页。
+        // 行情字段随后由菜单刷新流程按批次补齐。
+        const params = new URLSearchParams();
         if (forceRefresh) params.set("refresh", "1");
         const response = await fetch(`/api/macd-screener?${params}`, {cache:"no-store"});
         const payload = await response.json();
@@ -5269,6 +5258,9 @@
         const incomingStocks = payload.stocks || [];
         const incomingCodes = incomingStocks.map(stock => String(stock.code || "")).filter(Boolean).sort().join(",");
         if (state.pageView === "macd-screener") {
+          // 默认页会同时启动页面加载和侧栏计数读取；页面首轮尚未完成时，
+          // 不要因为暂时的空数组再次调用 openMacdScreener，避免互相清空表格。
+          if (!(state.whitelistStocks || []).length) return;
           const renderedCodes = (state.whitelistStocks || []).map(stock => String(stock.code || "")).filter(Boolean).sort().join(",");
           // 选股池重算恰好发生在两个请求之间时，绝不让表格继续展示旧快照。
           if (incomingCodes !== renderedCodes) {
@@ -5385,11 +5377,11 @@
       const entries = Object.entries(marketScopes);
       const [primary] = entries;
       el.overviewNav?.classList.toggle("active", state.pageView === "screener" && state.marketScope === primary[0]);
-      el.sectorStrengthNav.classList.toggle("active", state.pageView === "sector-strength");
-      el.indexAnalysisNav.classList.toggle("active", state.pageView === "index-analysis");
-      document.getElementById("conceptRankNav").classList.toggle("active", state.pageView === "concept-rank");
-      el.midtermNav.classList.toggle("active", state.pageView === "midterm");
-      el.hotSectorNav.classList.toggle("active", state.pageView === "hot-concept");
+      el.sectorStrengthNav?.classList.toggle("active", state.pageView === "sector-strength");
+      el.indexAnalysisNav?.classList.toggle("active", state.pageView === "index-analysis");
+      document.getElementById("conceptRankNav")?.classList.toggle("active", state.pageView === "concept-rank");
+      el.midtermNav?.classList.toggle("active", state.pageView === "midterm");
+      el.hotSectorNav?.classList.toggle("active", state.pageView === "hot-concept");
       el.limitUpNav?.classList.toggle("active", state.pageView === "limit-up");
       if (el.overviewCount) el.overviewCount.textContent = "";
       el.sectorTotal.textContent = hasNumber(state.scannedCount)
@@ -5420,7 +5412,7 @@
         if (submenu) submenu.hidden = expanded;
         document.getElementById("techNav")?.setAttribute("aria-expanded", String(!expanded));
       });
-      el.hotSectorGroups.innerHTML = Object.entries(hotSectorGroups).map(([group, concepts]) => `
+      if (el.hotSectorGroups) el.hotSectorGroups.innerHTML = Object.entries(hotSectorGroups).map(([group, concepts]) => `
         <div class="hot-sector-group">
           <span class="hot-sector-group-title">${escapeHtml(group)}${state.hotGroupLoading === group ? " · 加载中" : ""}</span>
           <div class="hot-sector-concepts">
@@ -5435,7 +5427,7 @@
           </div>
         </div>
       `).join("");
-      el.hotSectorGroups.querySelectorAll("[data-hot-concept]").forEach((button) => button.addEventListener("click", () => openHotConcept(button.dataset.hotConcept, button.dataset.hotGroup)));
+      el.hotSectorGroups?.querySelectorAll("[data-hot-concept]").forEach((button) => button.addEventListener("click", () => openHotConcept(button.dataset.hotConcept, button.dataset.hotGroup)));
       updatePageMeta();
     }
 
@@ -8451,6 +8443,37 @@
       el.marketAlertHistoryDirection.value = selected;
     }
 
+    async function loadMarketAlertHistoryMacdCharts() {
+      const nodes = [...el.marketAlertHistoryBody.querySelectorAll("[data-alert-history-macd]")]
+        .filter(node => !node.dataset.loaded && /^\d{6}$/.test(String(node.dataset.alertHistoryMacd || "")));
+      let cursor = 0;
+      const worker = async () => {
+        while (cursor < nodes.length) {
+          const node = nodes[cursor++];
+          const code = String(node.dataset.alertHistoryMacd || "");
+          node.dataset.loaded = "1";
+          try {
+            const stock = await getWhitelistStockData(code);
+            const closes = (stock?.quote?.history || []).map(item => Number(item.close)).filter(Number.isFinite);
+            if (closes.length < 20) throw new Error("history unavailable");
+            const ema = (values, period) => {
+              const multiplier = 2 / (period + 1); let previous = values[0];
+              return values.map((value, index) => { previous = index ? (value - previous) * multiplier + previous : value; return previous; });
+            };
+            const histogram = (fastPeriod, slowPeriod, signalPeriod) => {
+              const fast = ema(closes, fastPeriod), slow = ema(closes, slowPeriod);
+              const dif = fast.map((value, index) => value - slow[index]); const dea = ema(dif, signalPeriod);
+              return dif.map((value, index) => (value - dea[index]) * 2);
+            };
+            node.innerHTML = miniMacdPair(histogram(10, 20, 7).slice(-10), histogram(5, 10, 3).slice(-10));
+          } catch {
+            node.textContent = "--";
+          }
+        }
+      };
+      await Promise.all(Array.from({length: Math.min(5, nodes.length)}, worker));
+    }
+
     function currentMenuAlertScope() {
       if (state.pageView === "etf-basket") {
         const basket = ETF_BASKETS[state.etfBasketKey] || {};
@@ -8489,8 +8512,8 @@
     async function loadMarketAlertHistory(reset = false) {
       const view = state.marketAlertHistory;
       if (view.loading || (!reset && !view.hasMore)) return;
-      const alertHistoryColumns = '<colgroup><col style="width:8%"><col style="width:8%"><col style="width:12%"><col style="width:7%"><col style="width:8%"><col style="width:5%"><col style="width:7%"><col style="width:9%"><col style="width:10%"><col style="width:8%"><col style="width:18%"></colgroup>';
-      const alertHistoryHeader = '<thead><tr><th>时间</th><th>市场</th><th>个股名称</th><th>价格</th><th>涨跌幅</th><th>方向</th><th>最新价</th><th>最新涨跌幅</th><th>行业</th><th>来源</th><th>信号</th></tr></thead>';
+      const alertHistoryColumns = '<colgroup><col style="width:7%"><col style="width:4.8%"><col style="width:8.4%"><col style="width:10%"><col style="width:6%"><col style="width:7%"><col style="width:5%"><col style="width:6%"><col style="width:8%"><col style="width:9%"><col style="width:28.8%"></colgroup>';
+      const alertHistoryHeader = '<thead><tr><th>时间</th><th>市场</th><th>个股名称</th><th>近10日MACD</th><th>价格</th><th>涨跌幅</th><th>方向</th><th>最新价</th><th>最新涨跌幅</th><th>行业</th><th>信号</th></tr></thead>';
       if (reset) {
         view.page = 0; view.total = 0; view.hasMore = true;
         // 表头与数据区使用两张对齐表格；数据区单独滚动，无法跨越表头。
@@ -8522,8 +8545,9 @@
             const priceDirection = hasNumber(item.price) && hasNumber(item.closePrice)
               ? (Number(item.closePrice) > Number(item.price) ? '<span class="up" title="最新价高于告警价格">↑</span>' : Number(item.closePrice) < Number(item.price) ? '<span class="down" title="最新价低于告警价格">↓</span>' : "--")
               : "--";
-            return `<tr><td>${escapeHtml(item.time || "--")}</td><td>${escapeHtml(alertHistoryBoardName(item.board))}</td><td><strong>${escapeHtml(item.name || item.code)}</strong><br><span class="whitelist-code">${escapeHtml(item.code || "--")}</span></td><td>${hasNumber(item.price) ? formatPrice(item.price) : "--"}</td><td class="${quoteClass(item.changePct)}">${hasNumber(item.changePct) ? formatPct(item.changePct) : "--"}</td><td>${priceDirection}</td><td>${hasNumber(item.closePrice) ? formatPrice(item.closePrice) : "--"}</td><td class="${quoteClass(item.closeChangePct)}">${hasNumber(item.closeChangePct) ? formatPct(item.closeChangePct) : "--"}</td><td>${escapeHtml(item.industry || "--")}</td><td>${escapeHtml(item.pool || "--")}</td><td><span class="market-alert-signal ${tone}">${formatAlertSignal(signals)}</span></td></tr>`;
+            return `<tr><td>${escapeHtml(item.time || "--")}</td><td>${escapeHtml(alertHistoryBoardName(item.board))}</td><td><strong>${escapeHtml(item.name || item.code)}</strong><br><span class="whitelist-code">${escapeHtml(item.code || "--")}</span></td><td><span class="market-alert-history-macd" data-alert-history-macd="${escapeHtml(item.code || "")}">加载</span></td><td>${hasNumber(item.price) ? formatPrice(item.price) : "--"}</td><td class="${quoteClass(item.changePct)}">${hasNumber(item.changePct) ? formatPct(item.changePct) : "--"}</td><td>${priceDirection}</td><td>${hasNumber(item.closePrice) ? formatPrice(item.closePrice) : "--"}</td><td class="${quoteClass(item.closeChangePct)}">${hasNumber(item.closeChangePct) ? formatPct(item.closeChangePct) : "--"}</td><td>${escapeHtml(item.industry || "--")}</td><td><span class="market-alert-signal ${tone}">${formatAlertSignal(signals)}</span></td></tr>`;
           }).join(""));
+          loadMarketAlertHistoryMacdCharts();
           view.page = payload.page;
           view.total = payload.total;
           view.hasMore = view.page < payload.pages;
@@ -8672,11 +8696,11 @@
 
     el.overviewNav?.addEventListener("click", () => navigateMarket("all"));
 
-    el.sectorStrengthNav.addEventListener("click", () => openSectorStrength());
-    el.midtermNav.addEventListener("click", () => openMidterm());
-    el.indexAnalysisNav.addEventListener("click", () => openIndexAnalysis());
+    el.sectorStrengthNav?.addEventListener("click", () => openSectorStrength());
+    el.midtermNav?.addEventListener("click", () => openMidterm());
+    el.indexAnalysisNav?.addEventListener("click", () => openIndexAnalysis());
     el.midtermRefresh.addEventListener("click", () => loadMidtermPool(true));
-    el.hotSectorNav.addEventListener("click", () => {
+    el.hotSectorNav?.addEventListener("click", () => {
       const expanded = el.hotSectorNav.getAttribute("aria-expanded") === "true";
       el.hotSectorNav.setAttribute("aria-expanded", String(!expanded));
       el.hotSectorGroups.hidden = expanded;
@@ -8817,7 +8841,7 @@
       if (state.pageView === "sector-strength") scheduleSectorRefresh();
       if (state.pageView === "screener") scheduleScreenerRefresh();
       if (state.pageView === "limit-up") scheduleLimitUpRefresh();
-      if (!el.hotSectorGroups.hidden) scheduleHotGroupRefresh();
+      if (el.hotSectorGroups && !el.hotSectorGroups.hidden) scheduleHotGroupRefresh();
     });
 
     window.setInterval(() => {
@@ -9058,7 +9082,7 @@
         body.innerHTML = `<tr><td colspan="8">${escapeHtml(error.message || "概念排行暂不可用")}</td></tr>`;
       }
     }
-    document.getElementById("conceptRankNav").addEventListener("click", () => {
+    document.getElementById("conceptRankNav")?.addEventListener("click", () => {
       clearPendingStockClick(); clearSectorRefreshTimer(); clearScreenerRefreshTimer(); clearLimitUpRefreshTimer();
       if (state.chartOpen) closeChartModal();
       state.pageView = "concept-rank";
