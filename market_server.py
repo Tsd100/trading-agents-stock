@@ -3477,7 +3477,7 @@ def get_market_alert_history(
     with open_backtest_db() as connection:
         rows = connection.execute(
             f"SELECT id,trade_date,alert_time,code,name,board,pool,price,change_pct,industry,alert_type,config,signal,tone,signals_json "
-            f"FROM market_alert_history WHERE {where} ORDER BY alert_time ASC, created_at ASC",
+            f"FROM market_alert_history WHERE {where} ORDER BY alert_time DESC, created_at DESC",
             params,
         ).fetchall()
     # 已停用 MACD 翻红 / 翻绿告警；保留原始审计记录，但在所有告警视图中隐藏。

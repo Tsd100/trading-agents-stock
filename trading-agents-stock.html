@@ -3598,6 +3598,7 @@
       marketUpdatedAt: null,
       dataPolicy: null,
       dataPolicyFetchedAt: 0,
+      settledListRefreshKey: "",
       marketRegime: { label: "常态", minScore: 70 },
       marketSource: null,
       marketIndices: {},
@@ -5022,25 +5023,26 @@
         const livePrice = Number(liveStock?.price);
         if (!payload || !Number.isFinite(livePrice)) return "";
         const today = shanghaiTradeDate();
-        const realtime = aiComputeSessionActive() && String(liveStock?.quoteTradeDate || "") === today;
+        const quoteDate = String(liveStock?.quoteTradeDate || "");
+        const historyRows = payload.quote?.history || [];
+        const historyDate = String(historyRows.at(-1)?.date || "");
+        const includeLatestQuote = quoteDate === today && (!historyDate || historyDate < quoteDate);
         // 固定日线口径：历史只截至昨日，实时价格只作为今天唯一的一根日 K。
         // 这样不会把缓存或来源中的“今日收盘价”混入两次，也能随 10 秒行情
         // 刷新实时更新主/副 MACD 的最后一根柱体。
-        const closes = (payload.quote?.history || [])
-          .filter(item => !realtime || String(item.date || "") < today)
+        const closes = historyRows
+          .filter(item => !includeLatestQuote || String(item.date || "") < quoteDate)
           .map(item => Number(item.close))
           .filter(Number.isFinite);
-        if (realtime) closes.push(livePrice);
+        if (includeLatestQuote) closes.push(livePrice);
         if (closes.length < 20) return "";
         const ema = (values, period) => { const multiplier = 2 / (period + 1); let previous = values[0]; return values.map((value, index) => { previous = index ? (value - previous) * multiplier + previous : value; return previous; }); };
         const fast = ema(closes, 10), slow = ema(closes, 20); const dif = fast.map((value, index) => value - slow[index]); const dea = ema(dif, 7); const histogram = dif.map((value, index) => (value - dea[index]) * 2);
         const fastSecondary = ema(closes, 5), slowSecondary = ema(closes, 10); const difSecondary = fastSecondary.map((value, index) => value - slowSecondary[index]); const deaSecondary = ema(difSecondary, 3); const histogramSecondary = difSecondary.map((value, index) => (value - deaSecondary[index]) * 2);
         return miniMacdPair(histogram.slice(-10), histogramSecondary.slice(-10));
       };
-      // 服务端收盘快照更新后，浏览器内存中已生成的 SVG 也必须按交易日失效。
-      // 否则即使接口已修复，用户不强刷页面仍会看到旧历史算出的两副 MACD。
-      // 开盘时历史最后一根允许停留在昨日，前端会用实时价补成当日柱体；
-      // 午休/收盘后则必须与列表报价的交易日严格一致。
+      // 服务端收盘快照更新后，浏览器内存中的断档 SVG 必须失效；但午休和
+      // 收盘归档完成前，历史停在前一交易日是正常的，由最新报价合成当日柱。
       if (!aiComputeSessionActive()) {
         state.whitelistStocks.forEach((stock) => {
           const code = String(stock.code || "");
@@ -5054,7 +5056,10 @@
             const current = Date.parse(`${item?.date || ""}T00:00:00+08:00`);
             return Number.isFinite(previous) && Number.isFinite(current) && current - previous > 8 * 86_400_000;
           });
-          if (code && ((quoteDate && historyDate && historyDate !== quoteDate) || hasHistoryGap)) {
+          // 当日报价比历史缓存新一天，是午休/收盘归档前的正常状态；由前端
+          // 用最后报价合成临时日 K。只有历史反常超前或自身断档才清理缓存。
+          const historyAheadOfQuote = quoteDate && historyDate && historyDate > quoteDate;
+          if (code && (historyAheadOfQuote || hasHistoryGap)) {
             delete state.whitelistStockDataCache[code];
             delete state.whitelistChartCache[code];
             delete state.whitelistTrendCache[code];
@@ -5103,7 +5108,6 @@
           const today = shanghaiTradeDate();
           const currentStock = state.whitelistStocks.find(item => String(item.code || "") === code);
           const quoteDate = String(currentStock?.quoteTradeDate || today);
-          const realtime = aiComputeSessionActive() && quoteDate === today;
           // 分时属于实时数据，非交易时段可能不可用；不能因此连带清空日 K、MACD 和均线缩略图。
           const [intradayResult, stock] = await Promise.all([
             // 分时缓存由服务端按短 TTL 管理；不要为首屏每只股票重复强刷外部源。
@@ -5113,12 +5117,24 @@
             getWhitelistStockData(code),
           ]);
           const prices = (intradayResult?.points || []).map(item => Number(item.price)).filter(Number.isFinite);
-          const history = (stock.quote?.history || []).slice(-30);
-          const macdHistory = (stock.quote?.history || []).filter(item => !realtime || String(item.date || "") < today);
-          const closes = history.map(item => Number(item.close)).filter(Number.isFinite);
+          const sourceHistory = stock.quote?.history || [];
           const currentPrice = Number(currentStock?.price);
-          const macdCloses = macdHistory.map(item => Number(item.close)).filter(Number.isFinite);
-          if (realtime && Number.isFinite(currentPrice)) macdCloses.push(currentPrice);
+          const historyDate = String(sourceHistory.at(-1)?.date || "");
+          const includeLatestQuote = quoteDate === today && (!historyDate || historyDate < quoteDate) && Number.isFinite(currentPrice);
+          const chartHistory = sourceHistory.slice(-30).map(item => ({...item}));
+          if (includeLatestQuote) {
+            chartHistory.push({
+              date: quoteDate,
+              open: Number(currentStock?.open) || currentPrice,
+              high: Number(currentStock?.high) || currentPrice,
+              low: Number(currentStock?.low) || currentPrice,
+              close: currentPrice,
+              volume: Number(currentStock?.volume) || 0,
+            });
+          }
+          const history = chartHistory.slice(-30);
+          const closes = history.map(item => Number(item.close)).filter(Number.isFinite);
+          const macdCloses = closes.slice();
           const ema = (values, period) => { const multiplier = 2 / (period + 1); let previous = values[0]; return values.map((value, index) => { previous = index ? (value - previous) * multiplier + previous : value; return previous; }); };
           const fast = ema(macdCloses, 10), slow = ema(macdCloses, 20); const dif = fast.map((value, index) => value - slow[index]); const dea = ema(dif, 7); const histogram = dif.map((value, index) => (value - dea[index]) * 2);
           const fastSecondary = ema(macdCloses, 5), slowSecondary = ema(macdCloses, 10); const difSecondary = fastSecondary.map((value, index) => value - slowSecondary[index]); const deaSecondary = ema(difSecondary, 3); const histogramSecondary = difSecondary.map((value, index) => (value - deaSecondary[index]) * 2);
@@ -5130,21 +5146,25 @@
         } catch {
           // 失败不写入永久缓存；外部源偶发超时后，下一轮可重新补齐。
           state.whitelistMiniChartRetryAt[code] = Date.now() + 15_000;
-          node.textContent = "--"; if (klineNode) klineNode.textContent = "--"; if (macdNode) macdNode.textContent = "--";
+          const previous = state.whitelistChartCache[code];
+          node.innerHTML = previous?.intraday || "--";
+          if (klineNode) klineNode.innerHTML = previous?.kline || "--";
+          if (macdNode) macdNode.innerHTML = previous?.macd || "--";
         } finally { state.whitelistMiniChartLoading.delete(code); }
         }));
       }
       state.whitelistMiniChartBatchRunning = false;
       // 保持轮动，直到已展示名单的所有缩略图均写入缓存；滚到任意位置时
       // 都只读本地缓存回填，不会再临时发起一大批请求。
-      const remaining = allNodes
-        .some(item => {
+      const pendingNodes = allNodes
+        .filter(item => {
           const code = item.dataset.whitelistIntraday;
-          return code && !state.whitelistChartCache[code] && !state.whitelistMiniChartLoading.has(code)
-            && (state.whitelistMiniChartRetryAt[code] || 0) <= Date.now();
+          return code && !state.whitelistChartCache[code] && !state.whitelistMiniChartLoading.has(code);
         });
-      if (remaining && ["whitelist", "macd-screener", "etf-basket", "tech-basket"].includes(state.pageView)) {
-        window.setTimeout(() => { if (["whitelist", "macd-screener", "etf-basket", "tech-basket"].includes(state.pageView)) loadWhitelistMiniCharts(); }, 450);
+      if (pendingNodes.length && ["whitelist", "macd-screener", "etf-basket", "tech-basket"].includes(state.pageView)) {
+        const nextRetryAt = Math.min(...pendingNodes.map(item => state.whitelistMiniChartRetryAt[item.dataset.whitelistIntraday] || Date.now()));
+        const delay = Math.max(450, nextRetryAt - Date.now() + 50);
+        window.setTimeout(() => { if (["whitelist", "macd-screener", "etf-basket", "tech-basket"].includes(state.pageView)) loadWhitelistMiniCharts(); }, delay);
       }
     }
 
@@ -5693,11 +5713,29 @@
 
     async function refreshDataPolicy() {
       try {
+        const previousPolicy = state.dataPolicy;
         const response = await fetch("/api/data-policy", { cache: "no-store" });
         const payload = await response.json();
         if (!response.ok) throw new Error(payload.error || "数据时段读取失败");
         state.dataPolicy = payload;
         state.dataPolicyFetchedAt = Date.now();
+        // 午休或收盘边界只重读一次本地最终行情；非交易时段不轮询第三方。
+        const justSettled = Boolean(previousPolicy?.live) && !payload.live;
+        const settledKey = justSettled
+          ? `${payload.tradeDate || ""}:${chinaMarketClock().seconds >= 15 * 3600 ? "close" : "lunch"}`
+          : "";
+        if (settledKey && state.settledListRefreshKey !== settledKey) {
+          state.settledListRefreshKey = settledKey;
+          state.whitelistStockDataCache = {};
+          state.whitelistStockDataPromises = {};
+          state.whitelistChartCache = {};
+          state.whitelistTrendCache = {};
+          window.setTimeout(() => {
+            if (state.pageView === "macd-screener") openMacdScreener();
+            else if (state.pageView === "etf-basket") openEtfBasket(state.etfBasketKey);
+            else if (state.pageView === "tech-basket") openTechBasket(state.techBasketKey);
+          }, 0);
+        }
       } catch {
         // 网络短暂不可用时保留上一次服务端口径；过期后 marketSessionState 会退回本地时钟。
       }
@@ -8512,7 +8550,7 @@
     async function loadMarketAlertHistory(reset = false) {
       const view = state.marketAlertHistory;
       if (view.loading || (!reset && !view.hasMore)) return;
-      const alertHistoryColumns = '<colgroup><col style="width:7%"><col style="width:4.8%"><col style="width:8.4%"><col style="width:10%"><col style="width:6%"><col style="width:7%"><col style="width:5%"><col style="width:6%"><col style="width:8%"><col style="width:9%"><col style="width:28.8%"></colgroup>';
+      const alertHistoryColumns = '<colgroup><col style="width:8.4%"><col style="width:4.8%"><col style="width:8.4%"><col style="width:10%"><col style="width:6%"><col style="width:7%"><col style="width:5%"><col style="width:6%"><col style="width:8%"><col style="width:9%"><col style="width:23.04%"></colgroup>';
       const alertHistoryHeader = '<thead><tr><th>时间</th><th>市场</th><th>个股名称</th><th>近10日MACD</th><th>价格</th><th>涨跌幅</th><th>方向</th><th>最新价</th><th>最新涨跌幅</th><th>行业</th><th>信号</th></tr></thead>';
       if (reset) {
         view.page = 0; view.total = 0; view.hasMore = true;
