@@ -6147,7 +6147,8 @@
         });
         if (forceRefresh) query.set("refresh", "1");
         const controller = new AbortController();
-        const timeout = window.setTimeout(() => controller.abort(), 12000);
+        // 细分市场首次请求会逐只核验近 30 日日线，冷缓存可能需要数十秒。
+        const timeout = window.setTimeout(() => controller.abort(), whitelistMarketOnly ? 120000 : 12000);
         let response;
         try {
           response = await fetch(`/api/screener?${query}`, { cache: "no-store", signal: controller.signal });

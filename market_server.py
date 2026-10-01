@@ -105,6 +105,9 @@ MARKET_PAGE_SIZE = 100
 AUCTION_DATA_DIR = BASE_DIR / "data" / "auction"
 BACKTEST_DB_PATH = BASE_DIR / "data" / "backtest.sqlite"
 THRESHOLD_TIMES_PATH = BASE_DIR / "data" / "threshold_times.json"
+STOCK_UNIVERSE_DB_PATH = Path(os.environ.get(
+    "STOCK_UNIVERSE_DB_PATH", str(BASE_DIR.parent / "stock_backtest" / "data" / "stock_full.db")
+))
 BACKTEST_LOOKBACK_DAYS = 30
 BACKTEST_HORIZON_DAYS = 10
 BACKTEST_TARGET_RETURN = 0.05
@@ -282,9 +285,9 @@ MARKET_SCOPES: Dict[str, Dict[str, Any]] = {
     },
     "chinext": {
         "label": "创业板",
-        "description": "扫描创业板上市公司，覆盖 300 与 301 代码段。",
+        "description": "扫描创业板上市公司，覆盖 300、301 与 302 代码段。",
         "fs": "m:0+t:80",
-        "prefixes": ("300", "301"),
+        "prefixes": ("300", "301", "302"),
     },
     "star": {
         "label": "科创板",
@@ -302,8 +305,10 @@ MARKET_SCOPES: Dict[str, Dict[str, Any]] = {
 
 ALL_MARKET_SCOPE_KEYS = ("sh-main", "sz-main", "chinext", "star", "bse")
 
-_cache_lock = threading.Lock()
+_cache_lock = threading.RLock()
 _cache: Dict[str, Dict[str, Any]] = {}
+_local_market_snapshot_lock = threading.Lock()
+_local_market_snapshot: Dict[str, Any] = {}
 _intraday_cache: Dict[str, Dict[str, Any]] = {}
 _dynamic_cache: Dict[str, Dict[str, Any]] = {}
 _sector_strength_cache: Dict[str, Dict[str, Any]] = {}
@@ -1243,7 +1248,23 @@ def tushare_pro_request(api_name: str, params: Dict[str, Any], fields: str) -> D
     return result
 
 
-_a_share_trade_day_cache: Dict[str, bool] = {}
+_a_share_trade_day_cache: Dict[str, Tuple[bool, float]] = {}
+
+
+def tencent_index_trade_date() -> Optional[str]:
+    """Use the exchange index quote date when the calendar service is limited."""
+    try:
+        response = subprocess.run(
+            ["curl", "-fsSL", "--connect-timeout", "2", "--max-time", "3", "https://qt.gtimg.cn/q=sh000001"],
+            check=True, capture_output=True, timeout=4,
+        )
+        raw = response.stdout.decode("gb18030", errors="replace")
+        match = re.search(r'="([^"]+)"', raw)
+        fields = match.group(1).split("~") if match else []
+        stamp = fields[30] if len(fields) > 30 else ""
+        return datetime.strptime(stamp, "%Y%m%d%H%M%S").date().isoformat()
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+        return None
 
 
 def is_a_share_trading_day(value: date) -> bool:
@@ -1253,8 +1274,9 @@ def is_a_share_trading_day(value: date) -> bool:
         return False
     with _cache_lock:
         cached = _a_share_trade_day_cache.get(trade_date)
-    if cached is not None:
-        return cached
+    if cached is not None and time.monotonic() < cached[1]:
+        return cached[0]
+    expires_at = float("inf")
     try:
         with open_backtest_db() as connection:
             row = connection.execute(
@@ -1263,26 +1285,37 @@ def is_a_share_trading_day(value: date) -> bool:
         if row is not None:
             is_open = bool(row[0])
         else:
-            payload = tushare_pro_request(
-                "trade_cal", {"exchange": "SSE", "start_date": value.strftime("%Y%m%d"), "end_date": value.strftime("%Y%m%d")},
-                "cal_date,is_open",
-            )
-            items = (payload.get("data") or {}).get("items") or []
-            fields = (payload.get("data") or {}).get("fields") or []
-            record = dict(zip(fields, items[0])) if items and isinstance(items[0], list) else (items[0] if items else {})
-            if not record:
-                raise MarketDataError("交易日历未返回日期")
-            is_open = str(record.get("is_open") or "0") in {"1", "True", "true"}
-            with open_backtest_db() as connection:
-                connection.execute(
-                    "INSERT OR REPLACE INTO a_share_trading_calendar(trade_date,is_open,source,updated_at) VALUES (?,?,?,?)",
-                    (trade_date, int(is_open), "Tushare Pro trade_cal", datetime.now(CHINA_TZ).isoformat()),
+            index_date = tencent_index_trade_date()
+            now_local = datetime.now(CHINA_TZ)
+            if index_date == trade_date:
+                is_open = True
+            elif (value == now_local.date() and index_date and index_date < trade_date
+                  and (now_local.hour, now_local.minute) >= (9, 30)):
+                is_open = False
+                expires_at = time.monotonic() + 60
+            else:
+                payload = tushare_pro_request(
+                    "trade_cal", {"exchange": "SSE", "start_date": value.strftime("%Y%m%d"), "end_date": value.strftime("%Y%m%d")},
+                    "cal_date,is_open",
                 )
+                items = (payload.get("data") or {}).get("items") or []
+                fields = (payload.get("data") or {}).get("fields") or []
+                record = dict(zip(fields, items[0])) if items and isinstance(items[0], list) else (items[0] if items else {})
+                if not record:
+                    raise MarketDataError("交易日历未返回日期")
+                is_open = str(record.get("is_open") or "0") in {"1", "True", "true"}
+                with open_backtest_db() as connection:
+                    connection.execute(
+                        "INSERT OR REPLACE INTO a_share_trading_calendar(trade_date,is_open,source,updated_at) VALUES (?,?,?,?)",
+                        (trade_date, int(is_open), "Tushare Pro trade_cal", datetime.now(CHINA_TZ).isoformat()),
+                    )
     except (MarketDataError, OSError, sqlite3.Error, TypeError, ValueError):
-        # 日历源临时不可用时保持可用性；周末已在上方严格排除，工作日使用本地兜底。
-        is_open = value.weekday() < 5
+        # A weekday may be a market holiday. Recheck shortly because the index
+        # quote may not yet carry today's timestamp before the opening auction.
+        is_open = tencent_index_trade_date() == trade_date
+        expires_at = time.monotonic() + 60
     with _cache_lock:
-        _a_share_trade_day_cache[trade_date] = is_open
+        _a_share_trade_day_cache[trade_date] = (is_open, expires_at)
     return is_open
 
 
@@ -1315,11 +1348,16 @@ def get_market_data_policy(now: Optional[datetime] = None) -> Dict[str, Any]:
         mode = "live"
         refresh_seconds = 30
     elif before_open:
-        effective_date = latest_local_market_trade_date(today, strictly_before=True) or today
+        candidates = [latest_local_market_trade_date(today, strictly_before=True), tencent_index_trade_date()]
+        effective_date = max((item for item in candidates if item and item < today), default=today)
         mode = "previous-close"
         refresh_seconds = 0
     else:
-        effective_date = (today if is_trade_day else latest_local_market_trade_date(today)) or today
+        if is_trade_day:
+            effective_date = today
+        else:
+            candidates = [latest_local_market_trade_date(today), tencent_index_trade_date()]
+            effective_date = max((item for item in candidates if item and item <= today), default=today)
         mode = "current-close" if is_trade_day else "previous-close"
         refresh_seconds = 0
     return {
@@ -4693,6 +4731,39 @@ def tencent_quote_symbol(code: str) -> str:
     return ("bj" if bse_code(code) else "sh" if code.startswith(("5", "6", "9")) else "sz") + code
 
 
+def load_local_stock_universe() -> Tuple[Dict[str, Dict[str, str]], str]:
+    """Read the latest dated stock list without modifying the backtest database."""
+    path = STOCK_UNIVERSE_DB_PATH.resolve()
+    if not path.is_file():
+        raise MarketDataError(f"本地股票池不存在: {path}")
+    connection = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True, timeout=5)
+    try:
+        latest = connection.execute("SELECT MAX(last_date) FROM stock_info").fetchone()[0]
+        if not latest or not re.fullmatch(r"\d{8}", str(latest)):
+            raise MarketDataError("本地股票池缺少有效的数据截止日期")
+        industries = {
+            str(code): str(name) for code, name in connection.execute(
+                "SELECT code,board_name FROM stock_board_member WHERE board_category='申万一级'"
+            ) if name
+        }
+        stocks: Dict[str, Dict[str, str]] = {}
+        for code, name, exchange, first_date in connection.execute(
+            "SELECT code,name,exchange,first_date FROM stock_info WHERE last_date=?", (latest,)
+        ):
+            code = str(code or "")
+            if not re.fullmatch(r"\d{6}", code) or exchange not in ("SH", "SZ", "BJ"):
+                continue
+            stocks[code] = {
+                "name": str(name or code), "exchange": exchange,
+                "first_date": str(first_date or ""), "industry": industries.get(code, ""),
+            }
+        return stocks, datetime.strptime(str(latest), "%Y%m%d").strftime("%Y-%m-%d")
+    except sqlite3.Error as exc:
+        raise MarketDataError(f"本地股票池读取失败: {exc}") from exc
+    finally:
+        connection.close()
+
+
 def fetch_tencent_market_rows(codes: List[str]) -> Dict[str, Dict[str, Any]]:
     """Return the minimal live fields needed by the all-market MACD scan.
 
@@ -4717,21 +4788,28 @@ def fetch_tencent_market_rows(codes: List[str]) -> Dict[str, Dict[str, Any]]:
             for match in re.finditer(r'="([^"]+)"', raw):
                 fields = match.group(1).split("~")
                 code = str(fields[2] if len(fields) > 2 else "")
-                if code not in group or len(fields) < 49:
+                if code not in group or len(fields) < 50:
                     continue
                 price, previous_close = number(fields[3]), number(fields[4])
                 if price is None or price <= 0:
+                    continue
+                try:
+                    quote_time = int(datetime.strptime(fields[30], "%Y%m%d%H%M%S").replace(tzinfo=CHINA_TZ).timestamp())
+                except (ValueError, IndexError):
                     continue
                 result[code] = {
                     "f12": code, "f14": str(fields[1] or code), "f2": price,
                     "f3": number(fields[32]), "f17": number(fields[5]),
                     "f15": number(fields[33]), "f16": number(fields[34]),
                     "f18": previous_close,
-                    "f6": (number(fields[37]) or 0) * 10000,
+                    "f5": number(fields[36]),
+                    "f6": number(fields[37]) * 10000 if number(fields[37]) is not None else None,
+                    "f7": number(fields[43]),
                     "f8": number(fields[38]),
-                    "f20": (number(fields[44]) or 0) * 100000000,
-                    "f21": (number(fields[45]) or 0) * 100000000,
-                    "f62": None, "f100": "",
+                    "f10": number(fields[49]),
+                    "f20": number(fields[44]) * 100000000 if number(fields[44]) is not None else None,
+                    "f21": number(fields[45]) * 100000000 if number(fields[45]) is not None else None,
+                    "f62": None, "f100": "", "f124": quote_time,
                 }
             return result
         except (OSError, ValueError, subprocess.SubprocessError):
@@ -4850,6 +4928,8 @@ def record_quote_provider_result(provider: str, success: bool) -> None:
 
 def hydrate_list_quotes(payload: Dict[str, Any], *, fetch_if_cache_missing: bool = False) -> Dict[str, Any]:
     """Refresh known members in batches; persist dated quotes independently of membership."""
+    if not payload.get("stocks"):
+        return payload
     now_local = datetime.now(CHINA_TZ)
     intraday = is_intraday_alert_session(now_local)
     # 收盘后允许腾讯批量接口补一遍当日最终报价；开盘前则不再请求实时源，
@@ -5302,6 +5382,37 @@ def aggregate_sector_strength(quotes: List[Dict[str, Any]]) -> List[Dict[str, An
 
 
 def fetch_market_rows(market_key: str) -> Tuple[List[Dict[str, Any]], int]:
+    # A dated local universe supplies symbols; Tencent supplies the latest quote.
+    # The local list is a historical snapshot, never silently presented as a
+    # complete current listing. Keep the Eastmoney path below as a backup.
+    try:
+        with _local_market_snapshot_lock:
+            if time.monotonic() - _local_market_snapshot.get("created_at", 0) >= DYNAMIC_CACHE_TTL_SECONDS:
+                universe, as_of = load_local_stock_universe()
+                if len(universe) < 1000:
+                    raise MarketDataError("本地股票池数量不足，不能用于全市场扫描")
+                quotes = fetch_tencent_market_rows(list(universe))
+                if len(quotes) < len(universe) * 0.95:
+                    raise MarketDataError(f"腾讯批量报价覆盖不足: {len(quotes)}/{len(universe)}")
+                source = f"腾讯批量行情 + 本地股票池（截至{as_of}，返回{len(quotes)}/{len(universe)}只）"
+                for code, row in quotes.items():
+                    stock = universe[code]
+                    row.update({
+                        "f26": stock["first_date"], "f100": stock["industry"],
+                        "_marketSource": source, "_universeAsOf": as_of,
+                    })
+                _local_market_snapshot.update({
+                    "created_at": time.monotonic(), "rows": quotes, "universe_count": len(universe),
+                })
+            snapshot_rows = _local_market_snapshot["rows"]
+            if market_key == "all":
+                return list(snapshot_rows.values()), len(snapshot_rows)
+            market = MARKET_SCOPES[market_key]
+            filtered = [row for code, row in snapshot_rows.items() if code.startswith(market["prefixes"])]
+            return filtered, len(filtered)
+    except (MarketDataError, OSError, sqlite3.Error):
+        pass
+
     if market_key == "all":
         rows_by_code: Dict[str, Dict[str, Any]] = {}
         with ThreadPoolExecutor(max_workers=len(ALL_MARKET_SCOPE_KEYS)) as executor:
@@ -5354,6 +5465,12 @@ def fetch_market_rows(market_key: str) -> Tuple[List[Dict[str, Any]], int]:
             for page_rows in pages:
                 rows.extend(page_rows)
     return rows, total
+
+
+def market_rows_source(rows: List[Dict[str, Any]], market_label: str) -> str:
+    if rows and rows[0].get("_marketSource"):
+        return str(rows[0]["_marketSource"])
+    return f"东方财富{market_label}行情快照"
 
 
 def normalize_concept_name(name: str) -> str:
@@ -5679,12 +5796,19 @@ def fetch_dynamic_market_data(
     calibration = {"samples": 0, "updatedAt": datetime.now(CHINA_TZ).isoformat()}
     # 回测写入在后台任务中进行，不阻塞盘中实时行情首屏。
     apply_follow_up_calibration(final_quotes, calibration)
-    # 人气与关联概念互不依赖，合并并发请求，全部完成后再一次性返回页面。
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        popularity_future = executor.submit(add_ths_popularity, final_quotes, updated_at.strftime("%Y-%m-%d"))
-        related_future = executor.submit(add_related_sectors, final_quotes)
-        popularity_future.result()
-        related_future.result()
+    # Full whitelist pages can contain thousands of stocks. Per-stock public
+    # site requests would block the primary quote list for minutes. Keep their
+    # optional decorations explicitly unavailable in this bulk response.
+    if whitelist_only:
+        for quote in final_quotes:
+            quote["popularity"] = {"available": False, "rank": None, "source": "全量名单未查询人气"}
+            quote["relatedSectors"] = []
+    else:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            popularity_future = executor.submit(add_ths_popularity, final_quotes, updated_at.strftime("%Y-%m-%d"))
+            related_future = executor.submit(add_related_sectors, final_quotes)
+            popularity_future.result()
+            related_future.result()
     # “参与扫描”只统计通过黑名单预过滤的有效行情，避免把上一交易日黑名单、ST
     # 及银行/保险/地产等明确排除对象计入盘中选股扫描数。
     participating_scan_count = max(
@@ -5692,7 +5816,8 @@ def fetch_dynamic_market_data(
         len(market_quotes) - previous_blacklist_excluded_count - industry_excluded_count,
     )
     return {
-        "source": f"东方财富{market['label']}行情快照",
+        "source": market_rows_source(rows, market["label"]),
+        "universeAsOf": rows[0].get("_universeAsOf") if rows else None,
         "sector": {
             "key": market_key,
             "label": f"{market['label']}动态选股",
@@ -6226,12 +6351,19 @@ def get_whitelist_stocks(trade_date: Optional[str] = None, rebuild_membership: b
     permanent_codes = frozenset(permanent_entries)
     etf_codes = FIXED_OBSERVATION_POOL_CODES
     try:
-        active_blacklist_codes = {
-            str(item.get("code") or "")
-            for item in get_industry_blacklist().get("stocks", [])
-            if item.get("code")
-        }
-    except (MarketDataError, OSError, ValueError):
+        with open_backtest_db() as connection:
+            has_daily_blacklist = connection.execute("SELECT 1 FROM daily_blacklist LIMIT 1").fetchone() is not None
+        if has_daily_blacklist:
+            active_blacklist_codes = {
+                str(item.get("code") or "")
+                for item in get_industry_blacklist().get("stocks", [])
+                if item.get("code")
+            }
+        else:
+            # Custom exclusions are already in custom_codes; there is no dated
+            # blacklist to hydrate and no reason to call Tushare for its quotes.
+            active_blacklist_codes = set(custom_codes)
+    except (MarketDataError, OSError, ValueError, sqlite3.Error):
         active_blacklist_codes = set(custom_codes)
 
     def without_custom_blacklist(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -6473,14 +6605,16 @@ def get_whitelist_stocks(trade_date: Optional[str] = None, rebuild_membership: b
         row_float_cap = number(row.get("f21"))
         if not bse_code(code) and (row_float_cap is None or row_float_cap < 2_500_000_000):
             continue
-        quote = dynamic_snapshot(row, updated_at, "all")
+        timestamp = number(row.get("f124"))
+        row_updated_at = datetime.fromtimestamp(timestamp, CHINA_TZ) if timestamp is not None else updated_at
+        quote = dynamic_snapshot(row, row_updated_at, "all")
         if not quote:
             continue
         seen.add(code)
         whitelist_quotes.append(quote)
-    # 复用盘中选股页面的主营相关概念优先逻辑，保持两个页面口径一致。
-    # 全市场逐只请求概念会拖慢白名单接口；先补齐首屏范围，其余股票稍后显示为空。
-    add_related_sectors(whitelist_quotes)
+    # The first membership build can contain thousands of stocks. Requesting
+    # one concept page per stock blocks the list for minutes; unknown concepts
+    # remain explicit placeholders until a stock detail is requested.
     for quote in whitelist_quotes:
         stocks.append({
             "code": quote.get("code"),
@@ -6520,8 +6654,13 @@ def get_whitelist_stocks(trade_date: Optional[str] = None, rebuild_membership: b
             cached["source"] = "本地 SQLite 白名单收盘快照（行情源暂不可用）"
             cached["fallback"] = True
             return without_custom_blacklist(cached)
-    return {"source": "东方财富实时行情（已扣除黑名单）", "tradeDate": today,
-            "updatedAt": updated_at.isoformat(), "cached": False, "stocks": stocks}
+    quote_updated_at = (
+        datetime.fromtimestamp(number(rows[0]["f124"]), CHINA_TZ)
+        if rows and number(rows[0].get("f124")) is not None else updated_at
+    )
+    return {"source": market_rows_source(rows, "全市场") + "（已扣除黑名单）",
+            "tradeDate": quote_updated_at.strftime("%Y-%m-%d"),
+            "updatedAt": quote_updated_at.isoformat(), "cached": False, "stocks": stocks}
 
 
 def refresh_daily_blacklist(trade_date: str) -> None:
@@ -6843,7 +6982,8 @@ def fetch_sector_strength_data(market_key: str) -> Dict[str, Any]:
         if quote is not None:
             quotes.append(quote)
     return {
-        "source": f"东方财富{market['label']}行情快照",
+        "source": market_rows_source(rows, market["label"]),
+        "universeAsOf": rows[0].get("_universeAsOf") if rows else None,
         "marketDate": updated_at.strftime("%Y-%m-%d") if updated_at else None,
         "updatedAt": updated_at.isoformat() if updated_at else None,
         "fetchedAt": datetime.now(CHINA_TZ).isoformat(),
@@ -8187,7 +8327,7 @@ def fetch_limit_up_candidates() -> Dict[str, Any]:
             rows.extend(market_rows)
             totals += total
 
-    updated_at = datetime.now(CHINA_TZ)
+    updated_at: Optional[datetime] = None
     quotes: List[Dict[str, Any]] = []
     market_quotes: List[Dict[str, Any]] = []
     for row in rows:
@@ -8196,13 +8336,13 @@ def fetch_limit_up_candidates() -> Dict[str, Any]:
         if not main_board_code(code) or "ST" in name.upper() or "退" in name:
             continue
         timestamp = number(row.get("f124"))
-        row_updated_at = updated_at
+        row_updated_at = datetime.now(CHINA_TZ)
         if timestamp is not None:
             if timestamp > 10_000_000_000:
                 timestamp /= 1000
             try:
                 row_updated_at = datetime.fromtimestamp(timestamp, CHINA_TZ)
-                updated_at = max(updated_at, row_updated_at)
+                updated_at = row_updated_at if updated_at is None else max(updated_at, row_updated_at)
             except (OverflowError, OSError, ValueError):
                 pass
         quote = dynamic_snapshot(row, row_updated_at, "all")
@@ -8218,6 +8358,7 @@ def fetch_limit_up_candidates() -> Dict[str, Any]:
             continue
         quotes.append(quote)
 
+    updated_at = updated_at or datetime.now(CHINA_TZ)
     sectors = aggregate_sector_strength(market_quotes)
     sector_scores = {item["name"]: item["strengthScore"] for item in sectors}
     sector_details = {item["name"]: item for item in sectors}
@@ -8320,7 +8461,8 @@ def fetch_limit_up_candidates() -> Dict[str, Any]:
         candidates.append(quote)
     candidates.sort(key=lambda item: (item["limitUp"]["score"]["total"], item["changePct"]), reverse=True)
     return {
-        "source": "东方财富沪深主板行情快照 + 新浪证券不复权日线" + (" + 东方财富 EMT 09:25 竞价快照" if auction_snapshot.get("available") else ""),
+        "source": market_rows_source(rows, "沪深主板") + " + 新浪证券不复权日线" + (" + EMT 09:25 竞价快照" if auction_snapshot.get("available") else ""),
+        "universeAsOf": rows[0].get("_universeAsOf") if rows else None,
         "marketDate": market_date,
         "updatedAt": updated_at.isoformat(),
         "fetchedAt": datetime.now(CHINA_TZ).isoformat(),
